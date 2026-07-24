@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://iskandarus.github.io/photo-duplicates-manager-releases/sitemap.xml
