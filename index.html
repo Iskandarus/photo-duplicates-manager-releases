@@ -137,6 +137,37 @@
       Installers are currently unsigned — expect a SmartScreen / Gatekeeper warning on first launch.
     </div>
 
+    <h2>Which version goes with which</h2>
+    <p>Two different things are released here and they carry different numbers, because they are numbered by different things. The <strong>application</strong> version is its release tag. The <strong>resource manager SDK</strong> version is the version of the API a resource manager talks to, plus a counter of how many times the same API has been published. Neither can be worked out from the other, so here is what goes with what.</p>
+    <table>
+      <thead>
+        <tr><th>Application</th><th>Core API</th><th>Resource manager SDK</th><th>Date</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><a href="https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/v0.3.0-cm">0.3.0</a></td>
+          <td>3.0</td>
+          <td><a href="https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4">3.0.4</a> &ndash; the contract, the documents and <code>pdm-harness</code></td>
+          <td>2026-09-04</td>
+        </tr>
+        <tr><td>0.2.2 and earlier</td><td>not published</td><td>not published</td><td>up to 2026-07-28</td></tr>
+      </tbody>
+    </table>
+    <p>Every application release repeats its own row in its release notes, so the table travels with the download.</p>
+
+    <h2>Writing a resource manager</h2>
+    <p>A <strong>resource manager</strong> is a program that owns a collection of photographs &ndash; a folder on a disk, a cloud drive, a photo service &ndash; and wants PDM to find the duplicates in it. Anybody can write one: you implement no API and serve nothing to PDM. Everything you need is on the <code>sdk-v*</code> releases.</p>
+    <table>
+      <thead>
+        <tr><th>File</th><th>What it is</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>pdm-resource-manager-sdk-&lt;version&gt;.zip</code></td><td>The core API contract, its changelog and the documents written for somebody implementing it.</td></tr>
+        <tr><td><code>pdm-harness-&lt;version&gt;-&lt;platform&gt;</code></td><td>Plays the core on a loopback port and tells you what your manager got wrong. One self-contained file &ndash; nothing to install.</td></tr>
+      </tbody>
+    </table>
+    <p>Both carry the same number, so a tool and a guide out of one release always describe the same contract.</p>
+
     <footer>
       <p><a href="https://github.com/Iskandarus/photo-duplicates-manager-releases">View on GitHub</a> · <a href="https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/latest">All releases</a></p>
     </footer>
