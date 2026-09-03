@@ -32,7 +32,7 @@ Two different things are released here and they carry different numbers, because
 
 | Application | Core API | Resource manager SDK | Date |
 | --- | --- | --- | --- |
-| [0.3.0](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/v0.3.0-cm) | 3.0 | [3.0.4](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4) - the contract, the documents and `pdm-harness` | 2026-09-04 |
+| 0.3.0 (installers on the way) | 3.0 | [3.0.4](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4) - the contract, the documents and `pdm-harness` | 2026-09-04 |
 | 0.2.2 and earlier | not published | not published | up to 2026-07-28 |
 
 Every application release repeats its own row in its release notes, so the version table travels with the download rather than only living here.
