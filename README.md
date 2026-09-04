@@ -41,7 +41,7 @@ Every application release repeats its own row in its release notes, so the versi
 
 A **resource manager** is a program that owns a collection of photographs - a folder on a disk, a cloud drive, a photo service - and wants PDM to find the duplicates in it. Anybody can write one; you implement no API and serve nothing to PDM.
 
-Everything you need is on the `sdk-v*` releases:
+Everything you need is one download: **[Resource manager SDK 3.0.4](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4)**, which is the newest `sdk-v*` release. This line names the current one; the table above says which application version it goes with.
 
 | | |
 | --- | --- |
