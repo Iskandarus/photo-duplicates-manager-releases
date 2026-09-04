@@ -1,0 +1,3548 @@
+openapi: 3.1.0
+
+info:
+  title: PDM Core API
+  version: 3.0.0
+  summary: >-
+    What a resource manager's backend calls on Photo Duplicates Manager to drive the engine, to
+    feed it the images its own walk found, and to be told where the work stands.
+  description: |
+    This is the contract that **callers use on PDM**, and since 2.0 it is the only contract there
+    is.
+
+    **The core only answers**. A request arrives, an answer goes back; PDM never initiates
+    and never reaches outward. A resource manager is therefore a program PDM has no address for: it
+    walks its own resource, declares what it found, sends the bytes PDM asks for, and reads or is
+    told how the work is going. Everything PDM used to ask a manager - enumerate images, read
+    bytes, thumbnails, metadata, recycle, delete, move, connect an account - it no longer asks,
+    because it no longer calls. `resource-manager-api.v1.yaml` described that direction and is
+    withdrawn.
+
+    The second rule does not follow from the first and matters more: **neither PDM nor a manager
+    through PDM touches a file.** There is no field in this document in which a caller could name a
+    path on the machine PDM runs on, and no operation that would open one. What used to be a
+    grant an administrator ticked is the absence of a mechanism now, which is the stronger of the
+    two - a grant can be ticked by mistake and a missing mechanism cannot.
+
+    Prose, the scoping model, the credential shapes and the record of what 1.x served live in
+    `docs/core-api.md`. The negotiation mechanism is section 13 there; the support window, the
+    additive-only rules and the update story are `docs/version-compatibility.md`, and every
+    change to this document is recorded in `asp-back/contracts/CHANGELOG.md`.
+
+    ## Two consumers
+
+    1. **A resource manager's backend.** It holds the client credentials issued at registration,
+       exchanges them for an app token, and is the one correspondent its own frontend has. Four of
+       them are built in this repository and none of them is special.
+    2. **The MCP server**, a standalone project that reaches the engine only through this
+       API.
+
+    A third was designed for and never built: a workspace running cross-origin in a frame with its
+    calls brokered by a first-party shell. The postMessage protocol it needed was retired at 1.0
+    without ever being implemented, the shell was never built, and 2.0 removes the two token
+    operations and the two image operations that existed only for it.
+
+    ## Conventions
+
+    - Paths are relative to the core API root recorded on the deployment. `/v1` is the prefix and
+      **it did not move at 2.0**: a path prefix exists so two majors can be served side by side,
+      and there is no overlap to run here - nothing outside this repository implements this API,
+      and nothing could have. What a deployment speaks is read from `PDM-Core-Version`,
+      which refuses a major it does not speak with `400 unsupported_core_version` naming both.
+      Section 13 of `docs/core-api.md` is the whole argument.
+    - **No `:` and no `.` in any path.** It was the brokered channel's grammar - a guest-supplied
+      path was constrained to `^(/[A-Za-z0-9_~-]+)+$` - and the broker went with the protocol that
+      defined it. The rule stays: every path here was written to it, a segment reads better than a
+      verb suffix in a router and in a log, and the `resource:verb` style is therefore still not
+      used (`/v1/images/gone`, not `/v1/images:gone`). A resource manager's reference appears in
+      exactly one path segment, on the upload, percent-encoded by the caller; `.` and `..` are not
+      valid references anywhere in this document.
+    - Identifiers minted by PDM (`searchId`, `resultId`, `groupId`, `imageId`) are opaque,
+      unguessable and stable. Identifiers minted by a resource manager (`folderRef`, `imageRef`,
+      `accountRef`, `resourceManagerId`) are opaque to PDM as well: it stores them, hands them back
+      and never parses one.
+    - Every call is bound to a (user, caller registration) pair. Authority is
+      `granted scopes AND the permissions of the user behind the call`.
+    - Errors are `application/problem+json` (RFC 9457) with a stable machine `code`.
+  contact:
+    name: Photo Duplicates Manager
+    url: https://github.com/Iskandarus/photo-duplicates-manager
+
+servers:
+  - url: '{coreApiRoot}'
+    description: >-
+      The core API root of one PDM deployment. On the desktop build this is the loopback address of
+      PDM.API with the `/core` prefix; on a server deployment it is whatever the operator publishes.
+    variables:
+      coreApiRoot:
+        default: https://pdm.example.com/core
+        description: Scheme, host, optional port and the `/core` prefix.
+
+security:
+  - appToken: []
+
+tags:
+  - name: Discovery
+    description: What this caller may do and which resource managers it may act for.
+  - name: Searches
+    description: Start, follow, cancel and resume a duplicate search.
+  - name: Ingest
+    description: >-
+      The three operations a resource manager feeds a search with: declare what the walk found,
+      send the bytes PDM asks for, say the walk is over. This is the direction 2.0 reversed.
+  - name: Results
+    description: Stored search results, their groups, deletion and export.
+  - name: Groups
+    description: Hiding and unhiding a duplicate group.
+  - name: Images
+    description: >-
+      What PDM keeps about an image is an identifier, the manager's own reference, and what the
+      scan measured. One operation, and it is the manager saying that a reference is gone.
+  - name: Transfer
+    description: Import of a previously exported result.
+  - name: Tokens
+    description: >-
+      Credential exchange. One operation: a backend's client credentials for an app token.
+  - name: Stream
+    description: >-
+      The direction PDM speaks. A backend holds one connection open and is told what happened to
+      one user's long work, and how many images PDM will take next.
+
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Discovery
+  # ---------------------------------------------------------------------------
+
+  /v1/capabilities:
+    get:
+      operationId: getCapabilities
+      tags: [Discovery]
+      summary: What this caller may do.
+      description: |
+        The first call any consumer makes. It answers two questions that a caller would otherwise
+        have to discover by trial and error:
+
+        - which scopes are effective for this caller **after** the user's permissions have narrowed
+          them, so a read-only frontend never draws an action that turns into a 403;
+        - the limits PDM enforces, so a client can page, batch and pace its uploads correctly
+          instead of discovering the caps as 400s and 429s;
+        - **which image formats this deployment can decode**, so a manager filters its own walk
+          against one list instead of guessing at six extensions and finding that half of somebody's
+          photographs were never enumerated.
+
+        It answered a third in 1.x - which resource-manager capabilities were effective, so a move
+        action could be hidden for a manager that cannot move. PDM has no such knowledge now: a
+        capability was a claim in a manifest PDM fetched, and it fetches nothing. What a manager can
+        do is a fact about the manager, known where it is true.
+
+        The effective scope list is the whole point: `granted AND permitted`. It is computed here
+        exactly as it is enforced on every other call, so a client that hides what is absent from
+        this list can never be surprised.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The caller's effective authority and the limits in force.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilitiesResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/resource-managers:
+    get:
+      operationId: listResourceManagers
+      tags: [Discovery]
+      summary: The resource managers this caller may act for.
+      description: |
+        A catalogue: the registrations this caller may act for, and nothing more.
+
+        An app token minted for one registration sees one entry - its own - and cannot use this
+        call to learn that other resource managers exist. A token issued to the MCP server may
+        cover several, which is why the operation exists at all: it is the only way that consumer
+        can offer "pick a source" without a project reference on the API.
+
+        **It reports no capabilities and no health**, and that is 2.0's change here. Both were read
+        off a manifest PDM fetched from a manager and a health probe PDM ran against one, and PDM
+        makes neither call any more. A capability that is false told a client to hide an
+        action; the client that draws the action is the manager's own frontend, which knows what
+        its manager can do without asking anybody. Health told a client the manager was down; a
+        manager that is down is one whose own frontend does not load.
+
+        This is not the settings screen's `/providers`. That route stays first-party and
+        carries admin-facing fields; this one carries only what a consumer needs to act.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Descriptors visible to this caller. Possibly a single entry, never null.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResourceManagerListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Searches
+  # ---------------------------------------------------------------------------
+
+  /v1/searches:
+    get:
+      operationId: listSearches
+      tags: [Searches]
+      summary: Searches this caller started, newest first.
+      description: |
+        Replaces `GET /tasks/status/active`. Filter with `status=active` for the running one.
+
+        Scoped to (user, caller registration): a caller never sees a search another resource
+        manager started, even for the same user. That is not cosmetic - a shared list is a
+        cross-resource-manager channel.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - name: status
+          in: query
+          required: false
+          description: >-
+            Every value `SearchStatus` reports is accepted, so `?status=${search.status}` round
+            trips. `active` is the extra one: a convenience union of `queued` and `running`, for a
+            client that wants "whatever is in flight" without asking twice. Omit for everything this
+            caller started, within the retention the deployment keeps.
+          schema:
+            type: string
+            enum: [active, queued, running, completed, cancelled, failed, interrupted]
+        - name: resourceManagerId
+          in: query
+          required: false
+          description: >-
+            Only meaningful for a caller that may act for more than one resource manager. Rejected
+            with `forbidden` when it names one this caller may not act for.
+          schema:
+            $ref: '#/components/schemas/ResourceManagerId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of searches.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    post:
+      operationId: startSearch
+      tags: [Searches]
+      summary: Start a duplicate search over a folder.
+      description: |
+        **This opens a search; it does not start a walk.** In 1.x PDM answered 202 and then went
+        and enumerated the folder itself. It enumerates nothing now: the caller walks its own
+        resource and feeds what it finds to the three `Ingest` operations, and this call is what
+        mints the `searchId` those operations name. The response is the search in its initial state,
+        with `credits` saying how many images PDM will take bytes for straight away.
+
+        `folderRef` and `displayLabel` come from the caller's own picker. PDM stores both verbatim:
+        the ref because a result is keyed on it and a rescan replaces on it, the label because it is
+        the one readable thing PDM has about a folder and it is never derived from the ref.
+
+        **`recursive` and `cacheFolderRef` are gone.** Both were instructions to a walk PDM
+        performed. How deep to walk is now the caller's decision and needs nobody's permission;
+        warming a wider cache is `cacheOnly` on a declared item, which is the same idea in the units
+        that survive - PDM has no concept of a directory and never had, so it could not have
+        told which of the items it was sent were inside a narrower folder.
+
+        Engine tuning is deliberately absent. `nTrees`, `k` and the caching concurrency are thread
+        counts and index parameters, which is to say a denial-of-service knob in an untrusted
+        caller's hands, so this API accepts none of them. How many images PDM embeds at once is the
+        deployment's and not the caller's: it is derived from the machine PDM runs on, and a
+        deployment that wants a smaller number says so in its own configuration. `threshold`
+        is the one search parameter a user actually chooses, so it is the one this API accepts.
+
+        On success the search eventually produces a result keyed by
+        (user, resource manager, `folderRef`). Running a second search over the same folder replaces
+        that result.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartSearchRequest'
+      responses:
+        '202':
+          description: >-
+            Accepted. The search is open and waiting to be fed; `credits` says how many images it
+            will take bytes for now.
+          headers:
+            Location:
+              description: Path of the created search, for polling.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Search'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: >-
+            `search_already_running` when this caller already has a search in flight for this user
+            and resource manager; the body names it in `conflictingSearchId`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/searches/{searchId}:
+    get:
+      operationId: getSearch
+      tags: [Searches]
+      summary: One search, with its progress.
+      description: |
+        The authoritative reading, and the companion to `GET /v1/stream`. A caller normally
+        follows a search over the stream and calls this on start-up, after a reconnect, and
+        whenever the channel has been quiet. A reading is absolute state, so re-applying one
+        can never double-count, which is what makes the stream an optimisation over this rather
+        than a source of its own.
+
+        Progress reports an unknown total honestly. Until the caller says its walk is over with
+        `POST /v1/searches/{searchId}/complete`, `totalItems` is null and `isTotalKnown` is false,
+        and a client shows "found N so far, processed M" rather than a percentage against a
+        denominator nobody knows.
+
+        `credits` is here for the same reason the reading is: a caller that lost its stream, or
+        never opened one, must still be able to find out how many images PDM will take next.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The search.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Search'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/searches/{searchId}/groups:
+    get:
+      operationId: listSearchGroups
+      tags: [Searches]
+      summary: Duplicate groups a running search has found so far.
+      description: |
+        The live half of `GET /v1/results/{resultId}/groups`, and the reason a person does not have
+        to wait for a scan of a hundred thousand photographs to end before seeing anything.
+
+        The grouping stage recomputes the connected components of every similar pair it has found
+        roughly once a second, and this answers from the latest of those snapshots. What that means
+        for a caller:
+
+        - **It is a snapshot and not an accumulation.** Each one replaces its predecessor entirely,
+          so re-reading is always safe and never double-counts. `groupId` is stable across the
+          snapshots of one search, so a cluster that persists keeps its identity and a page redraws
+          rather than remounting every tile.
+        - **A `groupId` here is not a group's identifier.** A group gets one when the transaction
+          that saves the result writes it, and no operation in this document accepts the value this
+          answers with. It is for keying a rendering, and nothing else.
+        - **An empty page is an ordinary answer, and so is a late one.** A scan that has not
+          reached its grouping stage and one that has passed it both have no live groups at all. A
+          search that has *ended* is a third case and behaves differently: its last snapshot stays
+          readable here for a few minutes, for the reason a finished progress reading does - a
+          client that reads a second after completion should see the groups rather than nothing.
+          It is not the authority and it does not last. Once `GET /v1/searches/{searchId}` reports a
+          terminal status, read `GET /v1/results/{resultId}/groups`: that is what is persisted, what
+          can still be paged tomorrow, and what carries hiding.
+        - **What is on it is what the finished page has, minus what PDM does not know.** A reference
+          per image; no `imageId`, because PDM has not minted one yet, and nothing readable, because
+          it keeps none. The frontend that draws these tiles belongs to the manager
+          whose photographs they are and has the rest locally.
+        - **Paging counts images, exactly as it does on a result.** A group that does not fit is
+          split, the chunk carries `isPartial`, and `totalSize` holds the whole - so one rendering
+          serves both pages.
+
+        The set a caller watches appear is the set the saved result contains, plus whatever the last
+        batch added: both are built from the same pairs, and the last snapshot is taken before the
+        result is persisted rather than after.
+
+        `search_groups` on `GET /v1/stream` says when there is more to read. It carries the counts
+        and not the groups, for the reason nothing else on that channel carries bulk either.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of the groups found so far, which may be empty.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchGroupPageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/searches/{searchId}/cancel:
+    post:
+      operationId: cancelSearch
+      tags: [Searches]
+      summary: Cancel a running search.
+      description: |
+        Naming the search is what stops one resource manager from cancelling another's work: the
+        private route this replaced cancelled "the user's running task", which with several
+        managers is a set rather than a single thing.
+
+        Idempotent: cancelling an already-cancelled or already-finished search answers 200 with the
+        current state rather than an error, so a retry is harmless.
+
+        A cancelled search stops accepting items. An upload already in flight fails with
+        `search_not_ingesting`, which is the caller's signal to stop walking rather than an error to
+        report to anybody.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The search in its post-cancellation state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Search'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/searches/{searchId}/resume:
+    post:
+      operationId: resumeSearch
+      tags: [Searches]
+      summary: Resume an interrupted search.
+      description: |
+        A search is resumable while its status is `interrupted` - the run was lost to a crash or a
+        restart. Resuming produces a new `searchId` that records the one it continues from, and
+        reopens it for ingest.
+
+        **What resumes is the caller's walk, and PDM keeps no cursor for it.** In 1.x PDM held the
+        enumeration cursor because PDM did the walking, and resuming meant carrying on from the
+        last batch it had pulled. The walk is the caller's now, so where to continue from is the
+        caller's business too - and it may simply walk the whole source again. That is cheap for
+        the same reason a repeat scan is cheap: every item it re-declares comes back `cached`, and
+        an item that is cached costs no credit, no upload and no round trip.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '202':
+          description: Accepted. The body is the new search, with `resumedFromSearchId` set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Search'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            `conflict` when the search is not in `interrupted` state, `search_already_running` when
+            another search is in flight for this user and resource manager.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Ingest
+  # ---------------------------------------------------------------------------
+
+  /v1/searches/{searchId}/items:
+    post:
+      operationId: declareSearchItems
+      tags: [Ingest]
+      security:
+        - appToken: []
+      summary: Declare a batch of enumerated images, and be told which bytes are wanted.
+      description: |
+        The first of the three operations that feed a search, and the one that makes a repeat scan
+        free.
+
+        A resource manager walks its own resource and declares what it found: a reference, a content
+        version, a size, dimensions, dates. No bytes. PDM answers per item, in request order, with
+        one of three decisions - `cached`, `needsContent` or `rejected` - and a `cached` item is
+        finished: it costs no credit, no upload and no further call.
+
+        **That answer is the repeat-scan cache**. PDM keeps a content version per image and
+        an embedding per content, so a library nothing has changed in declares its items and uploads
+        nothing at all. It is the same decision the pull-based walk made on the other side of the
+        socket; it is stated as an answer here because the caller is now the side that would
+        otherwise waste the transfer.
+
+        **A content version is `contentHash` else `etag`, and the two are never confused.** They are
+        two fields rather than one because they are not the same claim: a hash is about content and
+        an entity tag is about a version at one source, so PDM records which kind of evidence it
+        holds and matches like against like. It parses neither - no algorithm is assumed and no
+        hash is ever recomputed - and a manager that has neither is still correct: its images are
+        asked for, hashed as they arrive, and the hash written back, so a second scan re-fetches
+        but does not re-embed.
+
+        **A format PDM cannot decode is refused here rather than after the transfer.** An item
+        whose `mimeType` names an image format absent from `formats.mediaTypes` on
+        `GET /v1/capabilities` is `rejected` with `unsupported_format`, and no bytes are asked for.
+        An item that declares no `mimeType`, or one that declares `application/octet-stream`, is
+        **not** refused: silence is not a claim about the format, and a manager whose filesystem
+        told it nothing must not lose a photograph over that. Filter your own walk against
+        `formats` and this refusal never fires - which is what it is for.
+
+        **Order does not matter and batches may overlap in time.** A manager may declare while it
+        uploads. What it may not do is send bytes for an item it has not declared: the upload names
+        a `searchId` and an `imageRef`, and an undeclared reference is `not_found`.
+
+        **Declaring the same reference twice is not an error.** The later declaration replaces the
+        earlier one and the decision is recomputed, which is what a manager whose walk restarts
+        needs. It is also why nothing in ingest carries an `Idempotency-Key`: the reference is the
+        key, and it is one the caller already holds.
+
+        A batch costs no credit - credits are spent by bytes. The balance after this call is on the
+        response so that a manager holding no stream can still pace itself.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestItemsRequest'
+      responses:
+        '200':
+          description: One decision per declared item, in request order, and the credit balance.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            `search_not_ingesting`. The search has completed, failed or been cancelled, or its walk
+            was already declared over. It takes no more items, and a caller that keeps sending is
+            walking a source nobody is waiting for.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          $ref: '#/components/responses/BatchTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/searches/{searchId}/items/{imageRef}/content:
+    put:
+      operationId: uploadSearchItemContent
+      tags: [Ingest]
+      security:
+        - appToken: []
+      summary: Send the bytes of one declared image.
+      description: |
+        The bytes, and the only binary request body in this document.
+
+        **`PUT`, addressed by the reference, and no idempotency key.** The target is named by the
+        URL and a second send of the same image is the same state. An idempotency key exists to
+        make a `POST` that mints something safe to retry; nothing is minted here, because the batch
+        already named the item. A key would be a second identity for a thing that has one, with a
+        store and an expiry of its own, and it would still not answer the question that actually
+        matters - whether these bytes are the bytes that were declared. `sizeBytes` and
+        `contentHash` answer that.
+
+        **One credit, held from the first byte.** A credit is one image. PDM returns it when it is
+        done with those bytes - embedded, cached or failed - so the balance bounds what is in flight
+        rather than what is per second. Sending without one is `429 ingest_credit_exhausted`. See
+        `GET /v1/stream` for how a credit arrives and `GET /v1/searches/{searchId}` for how the
+        balance is read; `limits.maxIngestCredits` is the most a search will ever hold, which is
+        what a caller sizes its own reader pool from.
+
+        **Nothing is written to disk**. The bytes go into a pooled buffer that the content
+        hash and the decoder both read, so `limits.maxImageBytes` is a real ceiling rather than a
+        policy: one enormous image is refused and the process is not. `credits * maxImageBytes` is
+        therefore the worst case PDM has to hold, which is the whole reason the unit is an image.
+
+        **A transfer that stops short fails that image, and half a photograph never becomes a cache
+        key.** The hash is taken as the bytes pass and closed only once the declared length has
+        arrived. Where the declaration named a `sizeBytes` or a `contentHash`, both are
+        checked here and a disagreement is `400 content_mismatch`: the image fails, the credit comes
+        back, and the caller may re-read and send it again.
+
+        **Resumable, and resume is the exception rather than the shape.** An ordinary send carries
+        no `Content-Range` and is one request; a caller that would rather not think about any of
+        this sends the whole image and retries it whole. A caller that lost a connection mid-image
+        may instead resume: `Content-Range: bytes <first>-<last>/<total>` appends to the prefix PDM
+        holds, and `<first>` must be exactly the length of that prefix - anything else is
+        `409 content_mismatch` with a `Range` header naming what PDM has. A zero-length `PUT` with
+        `Content-Range: bytes */<total>` asks where to resume without sending anything. A prefix is
+        held in memory against the credit it spent and expires after
+        `limits.ingestPartialSeconds`, which fails that image and returns the credit.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/ImageRef'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - name: Content-Range
+          in: header
+          required: false
+          description: >-
+            Only for a resumed transfer, and only in the two forms above. Absent means the body is
+            the whole image, which is the ordinary case.
+          schema:
+            type: string
+      requestBody:
+        required: false
+        description: >-
+          The image, exactly as the resource manager reads it. `Content-Length` is required with it:
+          PDM refuses a chunked body it cannot bound before reading it. **Required on every send, and
+          absent on exactly one request** - the resume probe, which is a `PUT` carrying
+          `Content-Range: bytes */<total>` and nothing else. That is why this is not marked required
+          here: a document that demanded a body would refuse the one request a caller makes after a
+          dropped connection. A `PUT` with neither a body nor a probe range is `invalid_request`.
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: >-
+            The whole image is in and the credit is released. Answered again, unchanged and without
+            spending a credit, for a reference PDM already holds in full - which is what makes a
+            retry safe.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestContentResponse'
+        '202':
+          description: >-
+            A prefix was accepted, or a resume probe was answered. `Range` says what PDM holds; send
+            from the next byte.
+          headers:
+            Range:
+              description: '`bytes=0-<last>`, the prefix PDM holds. Absent when it holds nothing.'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestContentResponse'
+        '400':
+          description: >-
+            `content_mismatch` when the bytes contradict the declaration - a length or a content
+            hash that does not agree with what the batch said. `invalid_request` for a malformed
+            `Content-Range` or a missing `Content-Length`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >-
+            `not_found`. No such search for this caller, or a reference this search has never had
+            declared.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: |
+            `content_mismatch` when a `Content-Range` does not continue the prefix PDM holds. The
+            `Range` header says what it holds.
+
+            `conflict` when the item's decision was `cached` or `rejected`. PDM did not ask for
+            these bytes, and accepting them quietly would make the answer it gave meaningless.
+
+            `search_not_ingesting` when the search has ended.
+          headers:
+            Range:
+              description: '`bytes=0-<last>`, on `content_mismatch` only.'
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          description: '`payload_too_large`. Over `limits.maxImageBytes`.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: >-
+            `ingest_credit_exhausted` when the caller has no credit for this search, and
+            `rate_limited` when it has run into its ordinary allowance. They are kept apart because
+            the remedies differ: wait for a credit on the stream, or wait `Retry-After` seconds.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /v1/searches/{searchId}/complete:
+    post:
+      operationId: completeSearchIngest
+      tags: [Ingest]
+      security:
+        - appToken: []
+      summary: The walk is over. No more items are coming.
+      description: |
+        Replaces the `isLast` PDM used to read off a batch it had pulled, and it is the only end of
+        stream there is: running out of items is not one, exactly as it was not on the other side.
+
+        **It ends the walk, not the search.** Bytes already accepted are still being embedded and
+        grouped when this returns, so the search stays `running` and its reading keeps moving. What
+        changes is the denominator: `isTotalKnown` becomes true, `totalItems` is what was declared,
+        and `percent` starts being answered. That is the moment a progress bar first means
+        anything.
+
+        **A walk that could not finish says so.** `outcome: "failed"` fails the search with the
+        detail the caller gives, which is the difference between a scan that ends and one that hangs
+        until a cleanup worker calls it interrupted. A caller that simply stops calling anything is
+        the second case, deliberately: PDM cannot tell a dead walk from a slow one, and guessing
+        would cancel somebody's scan.
+
+        Idempotent. A second call with the same outcome answers `200` and changes nothing; with a
+        different one it is `409 conflict`, because a walk that completed and later claims to have
+        failed is two statements about one fact.
+      parameters:
+        - $ref: '#/components/parameters/SearchId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteIngestRequest'
+      responses:
+        '200':
+          description: The search, with the walk closed and the total known.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Search'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: >-
+            `conflict` when the walk was already closed with a different outcome.
+            `search_not_ingesting` when the search was cancelled or had already failed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Results
+  # ---------------------------------------------------------------------------
+
+  /v1/results:
+    get:
+      operationId: listResults
+      tags: [Results]
+      summary: Stored results for this caller.
+      description: |
+        Replaces `GET /tasks/status/result`, which returns one entry per
+        (data source, source directory) pair for the whole user. Here the list is scoped to the
+        caller's own resource managers and each entry carries an opaque `resultId` instead of a
+        composite key the client has to reassemble.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - name: resourceManagerId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ResourceManagerId'
+        - name: folderRef
+          in: query
+          required: false
+          description: Narrow to the result for one scanned folder.
+          schema:
+            $ref: '#/components/schemas/Ref'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of result summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/results/{resultId}:
+    get:
+      operationId: getResult
+      tags: [Results]
+      summary: One result's summary.
+      description: >-
+        Counts, timings, the folder it came from and the state of the account behind it. Groups are
+        paged separately, because a result routinely holds thousands.
+      parameters:
+        - $ref: '#/components/parameters/ResultId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The result summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Result'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    delete:
+      operationId: deleteResult
+      tags: [Results]
+      summary: Delete a stored result.
+      description: |
+        Replaces `DELETE /tasks/search/result`, which identifies the result by
+        `dataSource` + `sourceDirectory` in the query string.
+
+        Deletes what PDM computed, never a photo. Nothing here reaches the resource manager, and
+        the scope that permits it (`results:delete`) is deliberately separate from the file scopes
+        for that reason.
+
+        Idempotent: deleting an already-deleted result answers 204.
+      parameters:
+        - $ref: '#/components/parameters/ResultId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '204':
+          description: Deleted, or already absent.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: '`conflict`. A search is currently writing to this result.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/results/{resultId}/groups:
+    get:
+      operationId: listResultGroups
+      tags: [Results]
+      summary: Duplicate groups in a result, paged.
+      description: |
+        Replaces both `GET /tasks/search/result` and `GET /tasks/search/hidden`. They are the same
+        query with `IsHidden` flipped, and shipping them as two routes with two response shapes is
+        how the two drift; `visibility` is one parameter on one collection.
+
+        Two behaviours a third party will otherwise get wrong, both inherited from the current
+        paging and both stated here because they are visible in the payload:
+
+        - **A group can be split across pages.** Paging counts images, not groups, so the tail of a
+          large group continues on the next page. Such a chunk carries `isPartial: true` and
+          `totalSize` holds the size of the whole group. A client that renders `images.length` as
+          the group size will be wrong on exactly the groups that matter most.
+        - **Nothing here is re-checked, because there is nobody to ask.** In 1.x serving this page
+          called the resource manager for batch metadata, so a photo deleted outside PDM since the
+          scan came back `available: false` rather than as a broken tile. PDM makes no such call
+          now, so `available`, `trashed`, `name` and `displayPath` are gone from
+          `ResultImage` and `availabilityChecked` is gone from the page. Every one of them was the
+          manager's own fact, and the frontend that draws the tile belongs to that manager: it has
+          them locally, for the price of a call it was making anyway. What PDM answers is what PDM
+          knows - an identifier, the manager's reference, and what the scan measured - and a
+          reference that no longer exists is something the manager tells PDM with
+          `POST /v1/images/gone`.
+      parameters:
+        - $ref: '#/components/parameters/ResultId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - name: visibility
+          in: query
+          required: false
+          description: >-
+            `visible` (default) excludes hidden groups, `hidden` returns only them, `all` returns
+            both and each group states its own `hidden` flag.
+          schema:
+            type: string
+            enum: [visible, hidden, all]
+            default: visible
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: A page of groups.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupPageResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/results/{resultId}/export:
+    get:
+      operationId: exportResult
+      tags: [Results]
+      summary: Export a result as a portable document.
+      description: |
+        Replaces `GET /export/result`, which returns a file attachment identified by
+        `dataSource` + `sourceDirectory`.
+
+        The response is the export document itself as JSON, not a file download. A caller that has
+        the document offers it to a user however it likes - a manager's frontend builds a `Blob`
+        from what its backend relays - and the MCP server wants the object rather than an
+        attachment. A real download has a `Content-Disposition` and originates wherever the user is
+        actually looking, which is never here.
+
+        Subject to the `EnableDataExport` feature flag, which today gates the whole `/export` group.
+        When it is off the operation answers 404 rather than 403, since the capability is absent
+        from `GET /v1/capabilities` in that deployment and a client should never have offered it.
+      parameters:
+        - $ref: '#/components/parameters/ResultId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The export document. Its internal schema is owned by `PDM.DataExporter` and versioned there.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportDocument'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Groups
+  # ---------------------------------------------------------------------------
+
+  /v1/groups/{groupId}:
+    patch:
+      operationId: updateGroup
+      tags: [Groups]
+      summary: Hide or unhide a duplicate group.
+      description: |
+        Replaces `POST /tasks/search/group/{groupId}/hide` and `.../unhide`.
+
+        One idempotent route instead of two imperative ones. A call whose response is lost is
+        retried, and `PATCH {"hidden": true}` on an already-hidden group is a no-op where a second
+        `hide` has to be defended against. It also gives the operation a single scope
+        (`groups:write`) rather than two that nobody would ever grant separately.
+
+        Hiding stays a core operation. It flips `IsHidden` on `DuplicateGroupEntity` and recomputes
+        the aggregates; it never touches a file, and a resource manager has nowhere to keep that
+        flag. What changes is who calls it and who draws the button.
+
+        Groups are addressed flat rather than nested under their result. A group id is already
+        globally unique and its parent result is authoritative in the database, so a nested path
+        would carry a second key that can disagree with the first - and the ownership check would
+        then have to decide which of the two to believe.
+      parameters:
+        - $ref: '#/components/parameters/GroupId'
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGroupRequest'
+      responses:
+        '200':
+          description: The group's new state, with the result aggregates recomputed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateGroupResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Images
+  # ---------------------------------------------------------------------------
+
+  /v1/images/gone:
+    post:
+      operationId: reportImagesGone
+      tags: [Images]
+      security:
+        - appToken: []
+      summary: Report that these references no longer exist.
+      description: |
+        The one thing PDM still needs to be told about an image, and the successor to
+        `POST /v1/files/recycle`, `/delete` and `/move`.
+
+        Those three asked PDM to ask the resource manager to delete a file. **The manager deletes
+        its own file now, and reports it.** PDM never held the authority that made the old shape
+        worth anything: it could not perform the deletion, it could not verify one, and since #254
+        it cannot even ask - so the ritual of routing a manager's own act through this API is honest
+        to drop rather than to keep. What is left is the part PDM owns and nobody else can do: a
+        grouping that has to stop naming something that is not there.
+
+        The three-way authority check went with them, and that is the point rather than a loss. It
+        was a scope, a permission and a declared capability, evaluated in that order so a client
+        could tell "you may not" from "this source cannot". One check is left and it is held by the
+        program that owns the resource: whether this user may delete this file is a question with
+        exactly one correct answerer, and PDM was never it.
+
+        **References, not `imageId`s.** The caller is the manager, the reference is its own, and it
+        is what it holds after deleting one of its files - there is no `imageId` for a file that no
+        longer exists to be read from anywhere. This is one of the two operations that take a
+        manager's reference as input; the other is the upload, which reads nothing (section 5 of
+        `docs/core-api.md` says why the 1.0 rule that references were output only is not weakened by
+        either).
+
+        A reference is scoped by the registration it belongs to, and for a token that names exactly
+        one that is automatic: it can only reach rows this caller produced, and there is nothing here
+        it could name that it could not have deleted. **A token that acts for several must send
+        `resourceManagerId`**, because a reference means nothing without knowing whose it is, and
+        omitting it is `invalid_request` rather than a guess.
+
+        **A reference PDM has never seen is not an error.** Managers delete files that were never in
+        a duplicate group, and reporting them is right rather than wasteful - they are counted as
+        `unknownRefs` and the call is a 200. A second report of the same reference is the same.
+
+        A group left with fewer than two images stops being a duplicate group and goes with them,
+        and the result's aggregates are recomputed. Both are counted, so a client updates its page
+        from the answer instead of refetching it.
+
+        **A reference that changed is not a reference that is gone, and 2.0 cannot say so.** 1.x
+        could: `POST /v1/files/move` answered with a `newImageRef` and PDM rewrote what it stored, so
+        an `imageId` survived a move that renamed everything underneath it. Nothing here replaces
+        that. A manager whose references are paths rather than stable ids - two of the four built
+        into PDM - therefore has two honest options after a user reorganises a folder, and both lose
+        something: report the old references gone, which drops those photographs out of their
+        duplicate groups, or say nothing, which leaves stored references that resolve to nothing and
+        tiles that will not open. **Report them gone**: a result that is smaller than it should be is
+        better than one that is wrong, and a rescan restores it.
+
+        This is a gap that is known rather than a judgement that moves do not matter, and it is cheap
+        to close - an operation that renames a reference is **additive**, so it is a minor and needs
+        no second major. Section 16 of `docs/core-api.md` is where it is recorded.
+
+        This does **not** delete a result, hide a group or touch an embedding. Deleting what PDM
+        computed is `DELETE /v1/results/{resultId}`, and it has its own scope precisely so that the
+        two are granted apart.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImagesGoneRequest'
+      responses:
+        '200':
+          description: What the report changed. Zeroes are an ordinary answer, not a 404.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagesGoneResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/BatchTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Transfer
+  # ---------------------------------------------------------------------------
+
+  /v1/imports/validate:
+    post:
+      operationId: validateImport
+      tags: [Transfer]
+      summary: Check an export document without storing anything.
+      description: |
+        Replaces `POST /import/validate` and, in the same answer, `GET /import/result/exists`.
+        Validation already has to resolve which result the document would land on in order to check
+        it, so reporting the collision in `conflictsWithResultId` costs nothing and removes a route
+        whose only job was to ask a question the previous call had already answered. Two calls also
+        meant a window between them in which the answer could change.
+
+        `POST /import/file` has no successor. It was `multipart/form-data` for a browser's file
+        input, and a caller here already has the bytes: it reads the file with an
+        ordinary file input and posts the document. The MCP server never had a file to begin with.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '200':
+          description: The document is valid. `conflictsWithResultId` names what an import would replace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportValidationResponse'
+        '400':
+          description: >-
+            `invalid_request`. The document did not parse or did not validate; `detail` says which
+            way.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          description: '`payload_too_large`. Larger than `limits.maxImportBytes`.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/imports:
+    post:
+      operationId: createImport
+      tags: [Transfer]
+      summary: Import an export document as a stored result.
+      description: |
+        Replaces `POST /import/json`. Validates first and refuses with the same 400 as
+        `/v1/imports/validate` rather than storing something half-understood.
+
+        The document names the resource manager it was exported from. Importing it under a
+        different one is refused: the refs inside are minted by that manager and mean nothing to
+        another, so the result would render as a page of broken tiles. A caller that may not act for
+        the document's resource manager gets `forbidden`.
+
+        Destructive when `replaceExisting` is set, so `Idempotency-Key` is required.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportRequest'
+      responses:
+        '201':
+          description: Imported. The body names the result it created or replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: >-
+            `conflict`. A result already exists for this (user, resource manager, folder) and
+            `replaceExisting` was not set. `conflictsWithResultId` names it.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          description: '`payload_too_large`.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # Tokens
+  # ---------------------------------------------------------------------------
+
+  /v1/tokens/app:
+    post:
+      operationId: exchangeAppCredentials
+      tags: [Tokens]
+      summary: Client-credentials exchange for a backend caller.
+      description: |
+        For a caller that runs as a service and holds its own credentials: a resource manager's
+        backend, and the MCP server (which reuses this machinery rather than inventing a
+        second credential type).
+
+        The app id and secret are the ones issued at registration and revealed exactly once.
+        The returned token carries the granted scopes, and every call made with it is still narrowed
+        by the permissions of the user it acts for.
+
+        This is the only credential exchange in this document, and the secret it takes must never
+        reach a browser. A page holds no secret it can keep - anything running in it can read one -
+        which is why a resource manager's frontend talks to its own backend and that backend talks
+        to PDM.
+      security:
+        - appCredentials: []
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppTokenRequest'
+      responses:
+        '200':
+          description: An access token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: >-
+            `unauthenticated`. Unknown app id, wrong secret, or a secret that has been rotated past
+            its overlap window.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: >-
+            `forbidden`. The registration is disabled or revoked, or a requested scope was never
+            granted.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  # ---------------------------------------------------------------------------
+  # The answer path
+  # ---------------------------------------------------------------------------
+
+  /v1/stream:
+    get:
+      operationId: subscribeStream
+      tags: [Stream]
+      summary: Hold open the channel PDM answers a user's long work on.
+      security:
+        - appToken: []
+      description: |
+        The other direction. Every other operation here is a caller asking PDM something; this is
+        PDM telling the caller. It exists because **the core only answers and never dials**: a resource manager is a program
+        PDM has no address for, and a long piece of work - a scan over a hundred thousand
+        photographs - is accepted over REST and finished hours later, with nowhere else to report
+        it.
+
+        **Server-sent events over a plain `GET`.** No handshake, no negotiate step, no framing
+        library: the credential is the app token the caller already holds, the refusals are the same
+        `application/problem+json` codes as everywhere else, and a backend in any language can hold
+        this open with the HTTP client it already has. There is no second channel behind it
+        either: the notification service PDM used to run for its own pages went at 3.0 with
+        `POST /v1/events`, so this is the whole of what PDM pushes anywhere.
+
+        **A subscriber is not a publisher.** There is no message a client can send on this
+        connection and no body on the request, and there is no operation anywhere in this document
+        that puts something on a user's screen: 3.0 removed the one that did.
+
+        **The bytes do not ride this socket either.** It is a message bus and not a bulk transport:
+        there is no resume in it, one connection is one queue, a long-lived socket carrying
+        gigabytes through a corporate proxy gives back the deployment win the reversal buys, and it
+        would weld a cheap channel held open for hours to a heavy one that churns. An upload is an
+        ordinary `PUT` (`Ingest`) and falls into the enforcement chain this API already has.
+
+        **The scope is the credential's, not a parameter.** Messages are about one (user,
+        registration) pair: the user the app token was minted for, and the registration it names.
+        `resourceManagerId` only narrows a token that names several, exactly as it does on an event.
+        A backend that could subscribe for a user it was not minted for could watch somebody else's
+        library.
+
+        **Reconnection is normal, and reconciliation is the answer.** A deploy rolls, a container
+        restarts, a socket drops, and a scan outlives several of those. Nothing is buffered for a
+        subscriber that is not connected - a queue held open for an absent backend is a leak - so
+        the opening `hello` frame states plainly whether the caller may trust what it already
+        believes. When `resync` is true, read `GET /v1/searches` and carry on from what it says.
+        Present the last id you saw as `Last-Event-ID` (or `?lastEventId=`) and `resync` is false
+        exactly when that id is the scope's current position and that position is not zero. Zero is
+        not a position: a scope nobody was listening to numbers nothing, so a rebuilt sequence starts
+        there and a subscriber that never saw a message has nothing to be continuous with.
+
+        **A slow subscriber loses messages rather than slowing the scan.** The queue in front of
+        each connection is bounded, and a backend that stops reading its socket is dropped from
+        rather than waited for. It is told: a `resync` event arrives before the next message it does
+        receive, and the answer is the same one - read where things stand.
+
+        **The connection never outlives the credential.** Authority is re-derived per call and a
+        stream is one call, so a socket held for a day would be a grant checked once yesterday. The
+        response ends when the app token expires - `hello` says exactly when - and the caller
+        re-exchanges its client credentials and reconnects.
+
+        A comment line (`: keepalive`) is written every `limits.streamHeartbeatSeconds`, so silence
+        appreciably longer than that is a dead socket rather than a quiet deployment. It is a
+        comment and not an event, because nothing having happened is not news.
+
+        ### Events
+
+        | `event` | Carries | Scope | Means |
+        | --- | --- | --- | --- |
+        | `hello` | `StreamHello` | `stream:subscribe` | First frame of every connection. No `id`: it is not part of the sequence. |
+        | `resync` | `StreamResync` | `stream:subscribe` | This connection lost messages. Reconcile. |
+        | `search_progress` | `SearchStreamMessage` | `searches:read` | A running search has a new reading. |
+        | `search_ended` | `SearchStreamMessage` | `searches:read` | A search completed, failed or was cancelled. |
+        | `search_groups` | `SearchGroupsMessage` | `searches:read` | A running search has formed more duplicate groups. |
+        | `ingest_credits` | `IngestCreditsMessage` | `searches:ingest` | PDM will take the bytes of this many more images. |
+
+        A minor version may add event kinds. A client must ignore one it does not know, exactly as
+        it ignores an unknown scope.
+
+        `stream:subscribe` opens the channel; the scope column is what travels on it. Every one of
+        these is a reading the same caller could have pulled - `GET /v1/searches/{searchId}` for the
+        first three, `GET /v1/searches/{searchId}/groups` for `search_groups` - and it is delivered
+        only to a connection whose caller also holds the scope that read is behind. Nothing here is
+        a way of learning something an ordinary call would have refused. Not holding one of them is
+        not an error and not a refusal: the connection opens, `hello` and the heartbeat arrive, and
+        the kinds this caller may not be told never do.
+
+        `search_progress` carries the same numbers `GET /v1/searches/{searchId}` answers with,
+        because they are the same reading: what a scan broadcasts is kept, and this is that reading
+        pushed. A client that both listens and polls never has to reconcile the two against each
+        other.
+
+        `search_ended` names the search and does not carry its result. The result id is written by
+        the transaction that persists the grouping, so a message asserting one would be reporting a
+        row rather than an event; read the search and the result id is on it.
+
+        `search_groups` is the same idea one step earlier: duplicates exist long before a result
+        does, and a person watching a scan of a hundred thousand photographs should not have to wait
+        for the end of it to see the first of them. It carries how many groups and how many images
+        there now are, not the groups themselves - a snapshot of a large library is thousands of
+        references and this connection drops for a subscriber that falls behind rather than waiting
+        for it. `GET /v1/searches/{searchId}/groups` is the read, paged, and it is the same shape a
+        finished result's page has.
+
+        `ingest_credits` is the backpressure the reversal owed. The pull model had it for
+        free - PDM chose how many items to ask for, and that choice **was** the limit - and a
+        caller that sends without being asked has to be told what will be accepted instead. So PDM
+        says how many images it will take the bytes of now, and a caller that honours the number
+        never has an upload refused. Three things about it are deliberate. It is a **count of
+        images, not a rate**: what is scarce is the memory an image in flight occupies and the depth
+        of the embedding queue, and `credits * limits.maxImageBytes` is exactly the worst case PDM
+        has to hold. It is **absolute and never a delta**: this channel drops messages for a
+        subscriber that falls behind, and a lost delta is a balance that stays silently wrong for
+        the rest of the scan, where an absolute number applied twice is the same number - the same
+        property that makes a progress reading safe to re-apply. And it is **also readable**,
+        on `GET /v1/searches/{searchId}` and on the answer to every declared batch, because a caller
+        must be able to ingest without holding this connection at all.
+
+        A 429 stays underneath it as the floor. Credits are the cooperative mechanism; a caller that
+        ignores them gets `ingest_credit_exhausted` on the upload, which is reactive by nature - on a
+        20 MB photograph it finds out at byte 19,000,000, which is the whole reason credits exist
+        and are not simply a 429 with better manners.
+      parameters:
+        - $ref: '#/components/parameters/CoreVersion'
+        - $ref: '#/components/parameters/RequestId'
+        - name: resourceManagerId
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/ResourceManagerId'
+          description: >-
+            Which registration to subscribe for, when the credential names more than one. Required
+            in that case; naming one the token does not act for is `forbidden`.
+        - name: lastEventId
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: >-
+            The last `id` this caller saw, for a client whose HTTP stack will not set
+            `Last-Event-ID`. Takes precedence over the header. An unreadable value is treated as
+            absent, which costs a reconcile and is never a refusal.
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+          description: The last `id` this caller saw. What an event-stream client resends by itself.
+      responses:
+        '200':
+          description: >-
+            The stream. Ends when the credential expires, when either side closes, or when the
+            deployment shuts down - all of which are ordinary, and all of which a client answers by
+            reconnecting.
+          headers:
+            PDM-Core-Version:
+              $ref: '#/components/headers/PdmCoreVersion'
+            Cache-Control:
+              schema:
+                type: string
+              description: '`no-store`. Nothing here is replayable.'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  The event-stream format. Each message is an optional `id:` line, an `event:` line
+                  naming one of the kinds above, and one `data:` line carrying compact JSON of the
+                  matching schema. Comment lines beginning with `:` are heartbeats and carry
+                  nothing.
+        '400':
+          description: >-
+            `invalid_request`. `resourceManagerId` was omitted by a credential that acts for more
+            than one registration.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: >-
+            `insufficient_scope` when `stream:subscribe` was never granted or the user's role does
+            not permit reading a search's status; `forbidden` when `resourceManagerId` names a
+            registration this token does not act for. Holding `stream:subscribe` and nothing else is
+            never a refusal: it opens the channel, and each kind on it reaches only a caller that
+            also holds the scope in the events table above. The rest of the stream is unaffected,
+            because a scope this caller was never granted is not an error, it is a kind of message
+            it never receives.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: >-
+            `rate_limited`. This caller already holds `limits.maxConcurrentStreams` connections for
+            this user, or the registration has reached its own ceiling. Retry after the stated
+            delay, having closed one.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait.
+
+components:
+
+  securitySchemes:
+
+    appToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Minted by `POST /v1/tokens/app` for a backend caller: a resource manager's own service, or
+        the MCP server. **It is the only credential class 2.0 has.** 1.x defined two more - a
+        capability token for a workspace in a frame and a media token for `img src` - and 2.0
+        removes them with the operations that minted them and the operations they were minted for.
+
+        Claims: `iss` (`pdm`), `aud` (`pdm-core`), `sub` (the internal user id), `reg` (the
+        registration id), `rmid` (the `resourceManagerId` or ids it may act for), `scope`
+        (space-delimited, already narrowed by the user's permissions), `iat`, `exp`, `jti`.
+
+        An app token acts for exactly one user and is narrowed by that user's permissions. It is not
+        an administrative credential, and there is no operation in this document that only an app
+        token can reach - there is nothing else left to compare it with.
+
+    appCredentials:
+      type: http
+      scheme: basic
+      description: >-
+        The app id and secret issued at registration, for the client-credentials exchange
+        only. The secret is stored hashed, revealed exactly once, and never appears in any response
+        in this document.
+
+  parameters:
+
+    SearchId:
+      name: searchId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+
+    ResultId:
+      name: resultId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/Id'
+
+    ImageRef:
+      name: imageRef
+      in: path
+      required: true
+      description: >-
+        The resource manager's own reference for the image, as it declared it on the batch, and the
+        only place in this document where one appears in a path. Percent-encode it: the grammar
+        permits `.`, `_`, `~` and `-`, all of which are safe in a segment, but a caller that builds
+        the URL by concatenation and a manager whose references are long make the same mistake
+        eventually. `.` and `..` are not valid references - see `Ref`.
+      schema:
+        $ref: '#/components/schemas/Ref'
+
+    CoreVersion:
+      name: PDM-Core-Version
+      in: header
+      required: false
+      description: >-
+        The `MAJOR.MINOR` this client was built against. PDM serves
+        `min(its own minor, this value)` and refuses a different major with
+        `400 unsupported_core_version` naming both. Absent means the client accepts whatever the
+        deployment serves, which is safe **within** a major, because minors are additive - across
+        one it is not, and since `/v1` did not move at 2.0 the header is the only thing that says
+        which one a deployment speaks. Send it. The response always states what was served.
+      schema:
+        $ref: '#/components/schemas/CoreVersionString'
+
+    RequestId:
+      name: PDM-Request-Id
+      in: header
+      required: false
+      description: >-
+        Correlation id supplied by the caller. Echoed in the response header and in the `instance`
+        member of any problem document, and carried onward as `PDM-Request-Id` on the resource
+        manager call the operation makes, so one value joins three logs. PDM generates one
+        when the caller does not.
+      schema:
+        type: string
+        maxLength: 128
+
+    Page:
+      name: page
+      in: query
+      required: false
+      description: 1-based page number.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: >-
+        Items per page, capped at `limits.maxPageSize`. Over the cap is a 400, not a silent clamp -
+        a client that asked for 500 and got 100 without being told will page wrongly.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 100
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Stable across retries of the same logical operation, freshly minted for a new one. PDM
+        records the outcome against the key and replays it instead of acting twice.
+
+        Required on `POST /v1/imports`, which is the only operation left that both changes stored
+        state and cannot be made safe by observing the end state: `replaceExisting` destroys a
+        result, and a retry with no key destroys a second one. 1.x required it on recycle, delete
+        and move as well - those are gone, and everything that replaced them is idempotent on a name
+        the caller already holds: the `imageRef` for an upload, the `searchId` for a completed walk,
+        the reference itself for a deletion the caller is reporting rather than requesting.
+      schema:
+        type: string
+        maxLength: 128
+
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Honoured when supplied. Not required here because a duplicate start is already caught by
+        `search_already_running`, which is a clearer answer than a replayed 202.
+      schema:
+        type: string
+        maxLength: 128
+
+  headers:
+
+    PdmCoreVersion:
+      description: The `MAJOR.MINOR` PDM served this call as.
+      schema:
+        $ref: '#/components/schemas/CoreVersionString'
+
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 0
+
+    Deprecation:
+      description: >-
+        RFC 9745. Present on every response of an operation this deployment intends to remove, from
+        the release that announces the removal onwards. `true` means deprecated as of now; an
+        IMF-fixdate means deprecated as of that moment. Always accompanied by `Sunset`. Defined here
+        from 1.0 although no operation is deprecated yet, so the header cannot be spelled two
+        different ways once one is - the policy that governs it is `docs/version-compatibility.md`.
+      schema:
+        type: string
+        examples:
+          - 'true'
+          - 'Wed, 01 Jul 2026 00:00:00 GMT'
+
+    Sunset:
+      description: >-
+        RFC 8594, IMF-fixdate. The earliest moment the operation may stop being served. Never
+        sooner than the support window allows, and never moved earlier once published. The
+        version that removes the operation is `deprecations[].removedIn` on `GET /v1/capabilities`;
+        this header carries the date of the same decision, and the two are published together.
+      schema:
+        type: string
+        examples:
+          - 'Wed, 01 Jul 2026 00:00:00 GMT'
+
+  responses:
+
+    BadRequest:
+      description: '`invalid_request`, or `unsupported_core_version` when the negotiated minor cannot be served.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Unauthenticated:
+      description: |
+        `unauthenticated`. No usable token: none was presented, it did not verify, or it has
+        expired.
+
+        An app token expires on a clock the caller can read - `expiresInSeconds` on the exchange,
+        `expiresAt` on a stream's `hello` - so the ordinary answer is to exchange the client
+        credentials again and replay. It is also the answer when the registration's grant stamp has
+        moved, which voids every token in flight; the exchange then either succeeds with the
+        new grant or answers `forbidden`, and both are true statements a caller can act on.
+
+        1.x had two more codes here, `capability_expired` and `capability_revoked`, for a
+        credential class 2.0 does not have.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: |
+        Three distinct situations, deliberately given three codes rather than one:
+
+        - `insufficient_scope` - the registration was never granted this operation. A permanent
+          answer for this caller; the fix is an administrator changing the grant.
+        - `insufficient_permission` - the scope is granted but the user behind the call may not do
+          it. This is `granted AND permitted` made visible: a read-only user stays read-only through
+          a resource manager.
+        - `forbidden` - the object exists but belongs to another user or another registration.
+
+        The last one is returned in preference to a 404 for a cross-registration read, and that is a
+        deliberate trade recorded in the issue: it discloses that an id exists. Ids are unguessable,
+        so what leaks is bounded, and a distinguishable answer is what makes the isolation testable
+        and auditable instead of hidden inside a generic not-found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    NotFound:
+      description: '`not_found`. No such object for this caller, or the feature is disabled in this deployment.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    BatchTooLarge:
+      description: >-
+        `payload_too_large`. More items than the operative cap: `limits.maxItemsPerBatch` for a
+        declared batch of enumerated items, `limits.maxOperationBatchSize` for a batch of
+        references being reported gone. The `maxItems` on the request schema is an absolute ceiling
+        across every deployment and is never permission - a deployment that caps lower is the safe
+        direction, and it is the reason a client sizes its batches from `GET /v1/capabilities`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    RateLimited:
+      description: >-
+        `rate_limited`. Buckets are per registration and per user, so one busy caller cannot starve
+        another, and one user cannot exhaust a registration's whole allowance.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+
+    # -- primitives -----------------------------------------------------------
+
+    Id:
+      type: string
+      minLength: 8
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_~-]+$'
+      description: |
+        An identifier minted by PDM: a `searchId`, `resultId`, `groupId` or `imageId`.
+
+        Opaque, stable, and unguessable. The last property is a requirement, not an observation:
+        `DuplicateSearchResultEntity` and `JobRecordEntity` use sequential integer primary keys
+        today, and a sequential public id turns the `forbidden`-versus-`not_found` distinction above
+        into a way to enumerate other users' work. The public id is therefore its own column, not
+        the primary key.
+
+        No dots. It was the brokered path grammar's rule, and it stays because it is what makes an
+        id safe in a path segment without anybody having to think about it.
+      examples:
+        - res_7f3a91c25be04d18
+        - 6f1d2c34-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+
+    Ref:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^(?!\.{1,2}$)[A-Za-z0-9._~-]+$'
+      description: |
+        An opaque reference minted by a resource manager: a `folderRef` or an `imageRef`. PDM stores
+        it, hands it back verbatim and never parses one.
+
+        `.` and `..` are excluded, which 1.x did not exclude. It is a tightening, which only a major
+        may do, and it is worth doing now that an `imageRef` appears in a path segment on the
+        upload: those two are the only strings in this grammar that mean something to a path
+        resolver, and refusing them here is one rule in one place rather than a normalisation step
+        every implementation has to remember. No resource manager can be minting either as an
+        identifier for a real image.
+      examples:
+        - Qzpcc2hvdG9zXDIwMjQ
+
+    ResourceManagerId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9][a-z0-9-]*$'
+      description: >-
+        The open string identifier that replaces the closed `DataSource` enum. Built-ins keep
+        their historical names.
+      examples:
+        - local
+        - googledrive
+
+    CoreVersionString:
+      type: string
+      pattern: '^[1-9][0-9]*\.[0-9]+$'
+      description: '`MAJOR.MINOR`. The major is also in the path.'
+      examples:
+        - '1.0'
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339, always UTC.
+
+    Scope:
+      type: string
+      description: |
+        What a caller may do. Granted per registration by an administrator and always intersected
+        with the permissions of the user behind the call.
+
+        | Scope | Operations | Permission it is narrowed by |
+        | --- | --- | --- |
+        | `searches:read` | list and read searches | `SessionStatusRead` |
+        | `searches:write` | start, cancel, resume | `SearchStart`, `SearchCancel` |
+        | `searches:ingest` | declare items, upload content, complete a walk | `SearchStart` |
+        | `results:read` | list and read results and their groups | `SearchResultRead` |
+        | `results:delete` | delete a stored result | `SearchResultDelete` |
+        | `groups:write` | hide and unhide | `GroupHide`, `GroupUnhide` |
+        | `images:forget` | `POST /v1/images/gone` | none |
+        | `export:read` | export a result | `ExportRead` |
+        | `import:write` | validate and import | `ImportValidate`, `ImportCreate` |
+        | `stream:subscribe` | `GET /v1/stream` | `SessionStatusRead` |
+
+        Four went at 2.0 with the operations they authorised: `images:read`, `files:recycle`,
+        `files:delete` and `files:move`. `events:publish` went at 3.0 with `POST /v1/events`,
+        because the channel it published into had no subscriber left to reach.
+
+        **`searches:ingest` is separate from `searches:write` on purpose.** A caller that may start
+        a search is not automatically one that may feed it: starting is a request for work and
+        feeding is a stream of somebody's photographs into this deployment's memory and storage, and
+        the two are worth being able to grant apart. They share a permission, `SearchStart`,
+        because they are halves of one act as far as the *user* is concerned - a user who may not
+        start a scan has nothing to feed - and a revocation that stops one mid-scan should stop the
+        other.
+
+        **`images:forget` is narrowed by no permission, and that is deliberate.** It reports a
+        deletion the caller has already performed on its own resource under its own authority; the
+        photograph is gone whatever PDM thinks. Narrowing it by `FileDelete` would mean a read-only
+        user's stored result keeps naming files that do not exist, permanently, with every later
+        page showing tiles that cannot open - which protects nothing and produces a wrong answer.
+        The grant is still a ceiling: a registration nobody granted it to cannot report anything.
+        It is not `images:write`, because a granted scope must never silently cover an operation
+        nobody authorised - the same reasoning that made recycle, delete and move three scopes
+        rather than one.
+
+        Reading hidden groups needs `results:read`, not a scope of its own: they are the same rows
+        behind one filter, and a separate scope would suggest a separation that does not exist in
+        the data.
+
+        `stream:subscribe` is narrowed, and by the same permission the equivalent read is: what it
+        delivers is a search's progress and its ending, exactly what `GET /v1/searches/{searchId}`
+        answers, and a push nobody could have pulled would be a permission bypass with better
+        latency. It used to be described here as the mirror image of `events:publish` - that one
+        authorising a caller to say something, this one to be told - and there is nothing left to
+        mirror: 3.0 removed that scope with its operation and the channel behind it. Every
+        kind on this stream names the scope it is narrowed by, in the table on `GET /v1/stream`.
+
+        A minor version may add scopes. A client must treat an unknown scope in
+        `GET /v1/capabilities` as something it cannot use, never as an error.
+      enum:
+        - searches:read
+        - searches:write
+        - searches:ingest
+        - results:read
+        - results:delete
+        - groups:write
+        - images:forget
+        - export:read
+        - import:write
+        - stream:subscribe
+
+    # -- discovery ------------------------------------------------------------
+
+    CapabilitiesResponse:
+      type: object
+      required: [coreVersion, oldestSupportedVersion, scopes, resourceManagers, limits, formats]
+      additionalProperties: false
+      properties:
+        coreVersion:
+          $ref: '#/components/schemas/CoreVersionString'
+        oldestSupportedVersion:
+          $ref: '#/components/schemas/CoreVersionString'
+          description: >-
+            The oldest minor of this major the deployment will negotiate. Equal to `coreVersion`
+            only when nothing older has ever shipped. It is here so a client can show the support
+            window rather than discover it as a 400 `unsupported_core_version`; the policy that
+            moves it is the version policy, and inside a major it moves only for a defect that cannot be fixed
+            additively.
+        scopes:
+          type: array
+          description: >-
+            Effective scopes: granted to the registration **and** permitted to the user. A client
+            that hides everything absent from this list can never present an action that 403s.
+          items:
+            $ref: '#/components/schemas/Scope'
+        resourceManagers:
+          type: array
+          description: >-
+            Ids this caller may act for. Exactly one for a resource manager's own backend, possibly
+            several for the MCP server.
+          items:
+            $ref: '#/components/schemas/ResourceManagerId'
+        limits:
+          $ref: '#/components/schemas/Limits'
+        formats:
+          $ref: '#/components/schemas/SupportedFormats'
+        deprecations:
+          type: array
+          description: >-
+            Operations this deployment still serves but intends to remove, with the version that
+            removes them. Empty, and present so a support window has somewhere to surface. It
+            was empty through the whole of 1.x as well: what 2.0 removed was removed at a major,
+            which is the moment a removal costs nothing to announce and everything to defer.
+          items:
+            type: object
+            required: [operationId, removedIn]
+            additionalProperties: false
+            properties:
+              operationId:
+                type: string
+              removedIn:
+                $ref: '#/components/schemas/CoreVersionString'
+              detail:
+                type: string
+                maxLength: 512
+
+    SupportedFormats:
+      type: object
+      description: |
+        What this deployment can turn into an embedding.
+
+        **It is one list because there is one pipeline.** A resource manager legitimately knows what
+        its own service can serve - Google Drive filters server-side by media type because that is
+        the only filter its API offers - but what PDM can *decode* is a fact about PDM, and a
+        manager that enumerates a format the decoder cannot read is worse than one that does not:
+        the file is walked, declared, transferred and only then fails, having cost somebody
+        bandwidth to learn nothing.
+
+        **Filter your walk against this.** Both spellings describe the same set and neither is
+        authoritative over the other: use `extensions` where you are walking names, `mediaTypes`
+        where your service tells you a type. Match case-insensitively, treat both as opaque
+        vocabularies, and do not hard-code either - the list grows in minors, and a manager that
+        pinned a copy of it in 2.1 is a manager whose users cannot scan the formats 2.2 added.
+
+        **It is advice with an enforcement behind it, not a promise about your files.** PDM refuses
+        a declared item whose `mimeType` names an image format absent from `mediaTypes`, with
+        `rejected` and `unsupported_format`, before it asks for any bytes. It does *not* refuse an
+        item that declares no `mimeType`, or one that declares `application/octet-stream`: silence
+        is not a claim, and throwing a photograph away over a filesystem that told its manager
+        nothing would be the worse error. Such an item is asked for and identified from its own
+        leading bytes.
+      required: [mediaTypes, extensions]
+      additionalProperties: false
+      properties:
+        mediaTypes:
+          type: array
+          minItems: 1
+          description: >-
+            Canonical media type per format, lower case. One entry per format and not one per
+            spelling: a deployment that accepts `image/heif` as well as `image/heic` publishes the
+            second and recognises both, so a manager reporting either is answered the same way.
+          items:
+            type: string
+            maxLength: 128
+        extensions:
+          type: array
+          minItems: 1
+          description: >-
+            Every file extension that names one of those formats, lower case and with the dot. Longer
+            than `mediaTypes`, because several extensions commonly name one format.
+          items:
+            type: string
+            maxLength: 16
+
+    Limits:
+      type: object
+      description: What PDM enforces. A client that respects these never discovers them as errors.
+      required:
+        - maxPageSize
+        - maxOperationBatchSize
+        - maxImportBytes
+        - maxItemsPerBatch
+        - maxImageBytes
+        - maxIngestCredits
+      additionalProperties: false
+      properties:
+        maxPageSize:
+          type: integer
+          minimum: 1
+          default: 100
+          description: >-
+            Cap on `pageSize`, enforced by the same filter the private routes use today. Asking for
+            more is a 400.
+        maxOperationBatchSize:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: >-
+            References per `POST /v1/images/gone`, and the operative cap - `413 payload_too_large`
+            is measured against this and not against the `maxItems` on the request schema. That
+            `maxItems` is an absolute ceiling of 1000 across every deployment, so this value is
+            always less than or equal to it. A client sizes its batches from here; a deployment that
+            caps lower than the ceiling makes schema validation weaker than the server, which is the
+            safe direction but is the reason a client must not treat `maxItems` as permission.
+        maxImportBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Largest accepted export document.
+        maxItemsPerBatch:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: >-
+            Items in one `POST /v1/searches/{searchId}/items`. The operative cap; over it is
+            `413 payload_too_large`. Larger than a file-operation batch on purpose - a declaration
+            is metadata and the whole point of it is to answer for a lot of images at once.
+        maxImageBytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            The largest image PDM will accept on an upload. It is a hard ceiling and not advice:
+            nothing is written to disk, so an image lives in a pooled buffer while it is
+            hashed and decoded, and this is what stops one enormous file from being the whole of
+            this deployment's memory. Over it is `413 payload_too_large` and that image fails; the
+            rest of the scan is unaffected.
+        maxIngestCredits:
+          type: integer
+          minimum: 1
+          description: >-
+            The most credits one search will ever hold, which is what a caller sizes its own reader
+            pool from. `maxIngestCredits * maxImageBytes` is the worst case PDM has to hold for one
+            search, and that product is how a deployment should be tuned rather than either number
+            alone.
+        ingestPartialSeconds:
+          type: integer
+          minimum: 1
+          description: >-
+            How long a partially uploaded image is held before it is abandoned. Expiry fails that
+            image and returns its credit. Only a caller that resumes an upload needs this; one that
+            sends whole images never meets it.
+        requestsPerMinute:
+          type: integer
+          minimum: 1
+          description: Rate limit for this caller, per registration and per user.
+        maxConcurrentStreams:
+          type: integer
+          minimum: 1
+          description: >-
+            `GET /v1/stream` connections one caller may hold open for one user at a time. More than
+            one, because a backend rolling from one instance to the next holds two for a moment.
+            Reported, unlike the registration-wide ceiling behind it, because a subscriber is the
+            whole of its own allowance here and can therefore act on the number.
+        streamHeartbeatSeconds:
+          type: integer
+          minimum: 1
+          description: >-
+            How often an idle `GET /v1/stream` writes a comment line. Set your read timeout from
+            this: silence appreciably longer is a dead socket, not a quiet deployment.
+
+    ResourceManagerListResponse:
+      type: object
+      required: [resourceManagers]
+      additionalProperties: false
+      properties:
+        resourceManagers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceManagerDescriptor'
+
+    ResourceManagerDescriptor:
+      type: object
+      description: |
+        What a consumer needs in order to act, which since 2.0 is an id and a name.
+
+        1.x also reported `connected`, `accountLabel`, `health`, `capabilities`, `contractVersion`
+        and `supportsPicker`. Every one of them was something PDM had asked a resource manager and
+        remembered, and PDM asks nothing now. They are not gone from the product, only from
+        here: whether an account is connected is a question with one correct answerer and it is the
+        manager, which is also the program drawing the screen that would show the answer.
+
+        The admin-facing view of a registration - credentials, trust flags, the audit trail - stays
+        in the first-party settings and admin surfaces and is not exposed here.
+      required: [resourceManagerId, displayName]
+      additionalProperties: false
+      properties:
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        displayName:
+          type: string
+          maxLength: 128
+        iconUrl:
+          type: string
+          format: uri
+          description: >-
+            Absent for a resource manager that offers no icon; clients fall back to a glyph. It came
+            from a manifest PDM fetched in 1.x and comes from the registration now.
+
+    # -- searches -------------------------------------------------------------
+
+    StartSearchRequest:
+      type: object
+      required: [folderRef]
+      additionalProperties: false
+      properties:
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+          description: >-
+            Required for a caller that may act for more than one resource manager. Redundant for a
+            token that names exactly one, and if present it must match, otherwise `forbidden`.
+        folderRef:
+          $ref: '#/components/schemas/Ref'
+          description: >-
+            The scan root, as the caller's own picker produced it. PDM never walks it and never
+            parses it: it is the key a result is stored under and replaced on, and it is handed back
+            unchanged on every read.
+        displayLabel:
+          type: string
+          maxLength: 256
+          description: >-
+            How that folder is named to a person. PDM stores it and hands it back wherever the folder
+            has to be named. Omitted means PDM has nothing readable to show and falls back to the
+            reference, which is why a picker should always supply it: a reference is not a name, and
+            PDM will never derive one from it.
+        accountRef:
+          type: string
+          maxLength: 200
+          description: |
+            Which of the caller's linked accounts at that resource manager the scan runs against.
+
+            Opaque here in the strongest sense: PDM never mints one, never parses one and has no
+            idea what an account is. It is minted by the resource manager (resource manager contract
+            1.2), kept on the search and on the result it produces, and handed back to that manager
+            on every later call about those images - which is the whole of what PDM does with it.
+
+            Absent means the default account, which is the one every call made before there was a
+            choice already acted on. A value the resource manager does not recognise is that
+            manager's to refuse, and it refuses with `forbidden` rather than falling back - so a
+            wrong ref is an error and never a silent read of the wrong drive.
+        threshold:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0.97
+          description: >-
+            Cosine similarity at or above which two images are a pair. The one search parameter a
+            user actually chooses.
+
+            It is a **similarity and not a distance**, which is worth one sentence because the two
+            read the same on the wire and mean opposite things: 0.97 is a strict search, 0.90 is a
+            loose one, and 0.03 puts every photograph you sent into one group.
+
+    Search:
+      type: object
+      required: [searchId, resourceManagerId, folderRef, status, createdAt]
+      additionalProperties: false
+      properties:
+        searchId:
+          $ref: '#/components/schemas/Id'
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        folderRef:
+          $ref: '#/components/schemas/Ref'
+        displayLabel:
+          type: string
+          maxLength: 256
+        accountRef:
+          type: string
+          maxLength: 200
+          description: >-
+            The linked account this scan runs against, as the resource manager named it. Absent
+            means the default account. Opaque - see `StartSearchRequest.accountRef`.
+        status:
+          $ref: '#/components/schemas/SearchStatus'
+        progress:
+          $ref: '#/components/schemas/SearchProgress'
+        resultId:
+          $ref: '#/components/schemas/Id'
+          description: Present once there is something to read. Set before `status` reaches `completed`.
+        resumedFromSearchId:
+          $ref: '#/components/schemas/Id'
+        credits:
+          type: integer
+          minimum: 0
+          description: >-
+            How many more images this caller may upload the bytes of right now. Absent once the
+            search accepts no more items - the walk was completed, or the search ended. It is the
+            same number `GET /v1/stream` pushes as `ingest_credits`, readable here because a caller
+            must be able to ingest without holding that connection at all.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the search was accepted. Present from the 202 onwards.
+        startedAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: >-
+            When it began executing. Absent while `queued`, which is the distinction
+            `JobRecordEntity` already draws between `CreatedAt` and `StartedAt`.
+        completedAt:
+          $ref: '#/components/schemas/Timestamp'
+        error:
+          type: object
+          description: Present when `status` is `failed`.
+          required: [code]
+          additionalProperties: false
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            detail:
+              type: string
+              maxLength: 1024
+        notices:
+          type: array
+          description: >-
+            Non-fatal things a user should be told about this scan: images refused for being over
+            `limits.maxImageBytes`, declared items whose bytes never arrived, an upload abandoned
+            part-way. Stable machine codes, localised by the client. In 1.x they described a
+            resource manager PDM had queried; they describe the ingest PDM actually saw now, which
+            is the only thing it can honestly report on.
+          items:
+            type: string
+            maxLength: 64
+
+    SearchStatus:
+      type: string
+      description: |
+        | Status | Meaning |
+        | --- | --- |
+        | `queued` | accepted, not yet executing |
+        | `running` | executing |
+        | `completed` | finished; `resultId` is readable |
+        | `cancelled` | stopped on request |
+        | `failed` | stopped on an error; `error` says which |
+        | `interrupted` | the run was lost to a crash or a restart and can be resumed |
+
+        `interrupted` is the state behind the resume prompt the app shows today. Terminal states are
+        `completed`, `cancelled` and `failed`; `interrupted` is not terminal, which is the whole
+        point of it.
+      enum: [queued, running, completed, cancelled, failed, interrupted]
+
+    SearchProgress:
+      type: object
+      description: |
+        Progress with an honest denominator, which since 2.3 usually exists from the first
+        reading.
+
+        A denominator comes from one of two places and never from a guess. The resource manager
+        counts its own resource and sends `expectedTotal` with a declaration, in which
+        case `totalItems` is that number from the moment it arrives; or the walk ends, and
+        `totalItems` is what actually arrived. `isTotalKnown` tells the two apart and means one
+        thing only: the walk is over and this number is final. **A total that is still
+        converging is a total** - it is drawn against, it may move in either direction, and it
+        is never reported below what has already been declared.
+
+        A scan whose manager sends no count behaves exactly as it did before: `totalItems` null,
+        `isTotalKnown` false, `percent` absent, and a client shows "found N so far, processed
+        M". Faking a denominator out of the count found so far produces a bar that goes
+        backwards, and nothing here does that.
+      required: [stage, processedItems, discoveredItems, isTotalKnown]
+      additionalProperties: false
+      properties:
+        stage:
+          $ref: '#/components/schemas/Stage'
+        processedItems:
+          type: integer
+          minimum: 0
+        discoveredItems:
+          type: integer
+          minimum: 0
+          description: Images enumerated so far. Keeps climbing while enumeration and processing overlap.
+        totalItems:
+          type: [integer, 'null']
+          minimum: 0
+          description: >-
+            The denominator, or null when nobody has one yet. Final only when `isTotalKnown` is
+            true; before that it is the manager's own count, corrected upward if more images
+            have been declared than it promised.
+        isTotalKnown:
+          type: boolean
+          description: >-
+            The walk is over and `totalItems` will not move again. It is not "a total exists" -
+            that is `totalItems` being non-null - and a client that needs to say whether a
+            number is settled reads this one.
+        percent:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: >-
+            Present exactly when `totalItems` is a number, and absent otherwise. Enforced by the
+            `if/then/else` below rather than left as prose, so a conformance suite can assert
+            it. It is a percentage of a denominator that may still move, so it can go backwards
+            when a manager corrects its count upward - which is the honest rendering of a count
+            that was wrong.
+        itemsPerSecond:
+          type: [number, 'null']
+          minimum: 0
+          description: |
+            How many images a second are being processed right now, or null when there is
+            not enough of a history to say - which is the case for the first reading of a scan
+            and for a reading taken after nothing has moved for a while.
+
+            Derived from the readings themselves and never stored, smoothed over a short window,
+            and **zero is a real answer**: between stages, and while the walk is running before
+            anything has been embedded, nothing is being processed and the honest figure is
+            nothing. It is the same numerator as `processedItems` against wall clock, so the two
+            can never disagree on screen.
+      if:
+        properties:
+          totalItems:
+            type: integer
+        required: [totalItems]
+      then:
+        required: [percent]
+      else:
+        properties:
+          percent: false
+
+    Stage:
+      type: object
+      description: |
+        Which phase of the pipeline is running.
+
+        `key` is a stable machine token and is what a client branches and localises on. `label` is
+        an English fallback for a client that has no string for a key it has never seen - which is
+        the normal case for a third party after PDM adds a stage. A frontend somebody else shipped
+        cannot localise an English display string it was handed, so it is handed a key as well.
+
+        Minors may add keys. A client must render an unknown key using `label` rather than treating
+        it as an error.
+      required: [key, label]
+      additionalProperties: false
+      properties:
+        key:
+          type: string
+          pattern: '^[a-z][a-z0-9_]*$'
+          description: >-
+            One of `initializing`, `enumerating`, `fingerprinting`, `computing_hashes`,
+            `extracting_embeddings`, `processing_batches`, `grouping`, `completed`, `cancelled`,
+            `error` in 1.0. `enumerating` arrived with the pull-based walk and is short-lived:
+            enumeration overlaps embedding, so the stage moves on once the first batch lands and the
+            walk shows up as a climbing `discoveredItems` instead. `fingerprinting` and
+            `computing_hashes` are no longer reported by a search - they run once per batch inside
+            `extracting_embeddings` - but remain part of the vocabulary.
+          examples:
+            - extracting_embeddings
+        label:
+          type: string
+          maxLength: 128
+          description: English fallback text. Never localised by PDM; the client localises from `key`.
+        processedItems:
+          type: integer
+          minimum: 0
+          description: Items processed within this stage, where the stage counts items at all.
+
+    SearchListResponse:
+      type: object
+      required: [searches, page]
+      additionalProperties: false
+      properties:
+        searches:
+          type: array
+          items:
+            $ref: '#/components/schemas/Search'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+
+    # -- results --------------------------------------------------------------
+
+    Result:
+      type: object
+      required: [resultId, resourceManagerId, folderRef, totalGroups, totalImages, createdAt]
+      additionalProperties: false
+      properties:
+        resultId:
+          $ref: '#/components/schemas/Id'
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        folderRef:
+          $ref: '#/components/schemas/Ref'
+        displayLabel:
+          type: string
+          maxLength: 256
+        accountRef:
+          type: string
+          maxLength: 200
+          description: >-
+            The linked account the scan ran against, as the resource manager named it. Absent means
+            the default account, or a resource manager that has none. It is what makes
+            `connectionState: differentAccount` a statement rather than a guess, and what lets a
+            client say which account a saved result belongs to. Opaque - see
+            `StartSearchRequest.accountRef`.
+        totalGroups:
+          type: integer
+          minimum: 0
+          description: Visible groups. Hidden ones are excluded, which is what the aggregate means today.
+        totalImages:
+          type: integer
+          minimum: 0
+        totalHiddenGroups:
+          type: integer
+          minimum: 0
+        totalBrokenImages:
+          type: integer
+          minimum: 0
+          description: >-
+            Files this scan could not read at all: no decoder in this deployment would open them, or
+            they were declared in a media type it does not carry and were refused before any bytes
+            moved. They are reported, not silently dropped.
+
+
+            It is a count of the whole scan and not of `brokenImages` below, which is bounded. Zero
+            for an imported result, which scanned nothing.
+        totalUnsupportedImages:
+          type: integer
+          minimum: 0
+          description: >-
+            Of `totalBrokenImages`, the ones in a format this deployment cannot decode - the rest are
+            files that are damaged.
+
+
+            The two are worth wording differently, which is the whole reason this field exists. A
+            photograph in a format nothing here reads is whole wherever it lives and converting it is
+            something a person can do; a damaged file has nothing to convert, and telling somebody to
+            convert one sends them to fix nothing. `GET /v1/capabilities` lists what can be decoded,
+            as `formats`.
+        threshold:
+          type: number
+          format: float
+          description: >-
+            The cosine similarity this result was produced at, in the units of
+            `StartSearchRequest.threshold`.
+        durationSeconds:
+          type: number
+          minimum: 0
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          $ref: '#/components/schemas/Timestamp'
+        origin:
+          type: string
+          enum: [search, import]
+          description: Whether this result was computed here or imported from an export document.
+      # `connectionState` was here in 1.x, saying whether the images could currently be loaded:
+      # connected, disconnected, or produced by a different linked account. PDM cannot answer any of
+      # the three now - the first two needed a call to the resource manager and the third needed the
+      # first two to mean something - and the program that can answer them is the one drawing the
+      # page. `accountRef` stays, because it is what makes the third answerable at all: a manager
+      # compares the result's account with the session's own and says which of "gone account", "no
+      # link at all" and "nobody could be asked" is true.
+
+    ResultListResponse:
+      type: object
+      required: [results, page]
+      additionalProperties: false
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/Result'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+
+    SearchGroupPageResponse:
+      type: object
+      description: |
+        A page of the duplicate groups a running search has formed so far.
+
+        Its own shape rather than `GroupPageResponse` with fields hollowed out, because nothing here
+        is persisted: there is no result to belong to, no group to hide, and no `imageId` - PDM's
+        identifier for an image is written by the transaction that saves the result.
+      required: [searchId, groups, page]
+      additionalProperties: false
+      properties:
+        searchId:
+          $ref: '#/components/schemas/Id'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchGroup'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+
+    SearchGroup:
+      type: object
+      description: One live duplicate group, or the part of it that fits on this page.
+      required: [groupId, images, size]
+      additionalProperties: false
+      properties:
+        groupId:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: >-
+            Stable across the snapshots of this search and meaningless outside it. It is **not** the
+            `groupId` the saved result will carry and no operation accepts it; it exists so a client
+            can key its rendering on something that does not change once a second.
+        images:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SearchGroupImage'
+        size:
+          type: integer
+          minimum: 1
+          description: Images in this chunk. Equal to `images.length`.
+        totalSize:
+          type: integer
+          minimum: 1
+          description: >-
+            Images in the whole group. Greater than `size` when the group is split across pages, and
+            required whenever `isPartial` is true.
+        isPartial:
+          type: boolean
+          default: false
+          description: >-
+            This chunk is the head or the continuation of a group that does not fit on one page.
+            Rendering `size` as the group size is wrong whenever this is true.
+      if:
+        properties:
+          isPartial:
+            const: true
+        required: [isPartial]
+      then:
+        properties:
+          totalSize:
+            type: integer
+            minimum: 1
+        required: [totalSize]
+
+    SearchGroupImage:
+      type: object
+      description: |
+        One image in a live group: your own reference, and nothing else.
+
+        There is nothing else to give. PDM has no identifier for it yet, and it keeps neither a name
+        nor a location for any image at all - the caller of this operation is the manager that
+        minted the reference and has all three without asking anybody.
+      required: [imageRef]
+      additionalProperties: false
+      properties:
+        imageRef:
+          $ref: '#/components/schemas/Ref'
+
+    GroupPageResponse:
+      type: object
+      required: [resultId, groups, page]
+      additionalProperties: false
+      properties:
+        resultId:
+          $ref: '#/components/schemas/Id'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/DuplicateGroup'
+        brokenImages:
+          type: array
+          description: >-
+            Files the scan could not read. Present on the first page only, since they belong to the
+            result rather than to any group.
+
+
+            It is bounded, and `Result.totalBrokenImages` is not: fewer entries than that count is
+            the bound rather than a contradiction. The list is here so somebody can act on the files,
+            and past a few hundred nobody acts file by file - they act on the pattern, which the two
+            counts carry in full. Each entry says which kind it is in `errorCode`.
+
+
+            An entry carries an `imageRef` like any other and an `imageId` that no operation accepts:
+            there is nothing to hide, delete or open, since the file did not open here either.
+          items:
+            $ref: '#/components/schemas/ResultImage'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+
+    DuplicateGroup:
+      type: object
+      required: [groupId, hidden, images, size]
+      additionalProperties: false
+      properties:
+        groupId:
+          $ref: '#/components/schemas/Id'
+        hidden:
+          type: boolean
+        images:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ResultImage'
+        size:
+          type: integer
+          minimum: 1
+          description: >-
+            Images in this chunk. Equal to `images.length` - stated so a conformance suite can
+            assert the two never contradict.
+        totalSize:
+          type: integer
+          minimum: 1
+          description: >-
+            Images in the whole group. Greater than `size` when the group is split across pages, and
+            required whenever `isPartial` is true - see the `if/then` below.
+        isPartial:
+          type: boolean
+          default: false
+          description: >-
+            This chunk is the continuation or the head of a group that does not fit on one page.
+            Rendering `size` as the group size is wrong whenever this is true, which is why the
+            correct number cannot be optional here.
+      if:
+        properties:
+          isPartial:
+            const: true
+        required: [isPartial]
+      then:
+        properties:
+          totalSize:
+            type: integer
+            minimum: 1
+        required: [totalSize]
+
+    ResultImage:
+      type: object
+      description: |
+        One image inside a result: PDM's identifier for it, the resource manager's own reference,
+        and what the scan measured.
+
+        **Nothing readable is here, and that is 2.0's largest change to a response.** 1.x carried
+        `name` - required - along with `displayPath`, `available` and `trashed`. All four were the
+        resource manager's facts, fetched by PDM on every read of a page and answered back; PDM
+        fetches nothing now. They are not lost: the frontend that renders this tile belongs
+        to the manager whose file it is, and it has all four locally without asking anybody. A
+        stored copy would have been worse than absent anyway - a name goes stale the moment somebody
+        renames the file.
+
+        `imageRef` was optional and is required, which only a major may do. It is what a caller
+        joins this row to its own item with, and after the four fields above there is nothing else
+        it could join on.
+      required: [imageId, imageRef]
+      additionalProperties: false
+      properties:
+        imageId:
+          $ref: '#/components/schemas/Id'
+          description: >-
+            PDM's identifier, minted here, stable, and the one this API accepts on its own
+            operations.
+        imageRef:
+          $ref: '#/components/schemas/Ref'
+          description: >-
+            The resource manager's identifier for the same item, exactly as it was declared. PDM
+            stores it and hands it back; the one operation that accepts one as input is
+            `POST /v1/images/gone`, where the caller is the manager whose reference it is.
+        sizeBytes:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+        width:
+          type: [integer, 'null']
+          minimum: 0
+        height:
+          type: [integer, 'null']
+          minimum: 0
+        resolutionDpi:
+          type: [integer, 'null']
+          minimum: 0
+        photoCreatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        modifiedAt:
+          $ref: '#/components/schemas/Timestamp'
+        error:
+          type: string
+          maxLength: 512
+          description: >-
+            Why this image could not be processed, for entries in `brokenImages`. English, and meant
+            to be read rather than parsed - word it from `errorCode` beside it.
+        errorCode:
+          type: string
+          enum: [unsupported_format, unreadable_bytes]
+          description: >-
+            Which kind of unreadable this entry is, for entries in `brokenImages`.
+
+
+            `unsupported_format` is the same code a declaration naming such a media type is refused
+            with, and deliberately so: it is one fact about one file whichever moment it was noticed
+            in - before the bytes moved, or after they arrived and named no container this deployment
+            carries. `unreadable_bytes` means the file announced a format that is decoded here and
+            no decoder would open it.
+
+
+            Absent outside `brokenImages`. An entry with no size, no dimensions and no dates is the
+            ordinary shape here: nothing about the file was ever measured, because it did not open.
+
+    PageInfo:
+      type: object
+      required: [page, pageSize, totalPages, totalItems]
+      additionalProperties: false
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        pageSize:
+          type: integer
+          minimum: 1
+        totalPages:
+          type: integer
+          minimum: 0
+        totalItems:
+          type: integer
+          minimum: 0
+
+    ExportDocument:
+      type: object
+      description: |
+        The portable form of a result, produced and consumed by `PDM.DataExporter` and
+        `PDM.DataImporter`. Its internal schema is owned there and deliberately not restated here:
+        this API transports the document, it does not define it.
+
+        Two fields are named because this API depends on them, and both describe format `2.0`, which
+        the format bump shipped:
+
+        - `version` - `DuplicateSearchResultExport.Version`, a string, `"2.0"`.
+        - `resourceManagerId` - the open string that replaced `dataSource`, the name of the closed
+          enum format `1.0` carried. The importer stays able to read that old spelling.
+
+        The requirement itself is what matters and survives either spelling: the document has to name
+        the resource manager it came from, or an import lands refs under a manager that did not mint
+        them and the result renders as a page of broken tiles.
+
+        Everything else in the document is passed through untouched, which is why this schema is
+        open.
+      required: [version, resourceManagerId]
+      properties:
+        version:
+          type: string
+          maxLength: 32
+          description: Export format version, as `PDM.DataExporter` writes it.
+          examples:
+            - '2.0'
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+          description: >-
+            Introduced by the format bump that replaced `dataSource`. A `1.0` document is upgraded
+            by the importer, which maps the old enum values onto the built-in ids.
+        folderRef:
+          $ref: '#/components/schemas/Ref'
+      additionalProperties: true
+
+    # -- groups ---------------------------------------------------------------
+
+    UpdateGroupRequest:
+      type: object
+      required: [hidden]
+      additionalProperties: false
+      properties:
+        hidden:
+          type: boolean
+          description: >-
+            The state to put the group in, not a state to toggle. A toggle is not idempotent and
+            this call can be retried.
+
+    UpdateGroupResponse:
+      type: object
+      required: [groupId, hidden, resultId, totalGroups, totalImages]
+      additionalProperties: false
+      properties:
+        groupId:
+          $ref: '#/components/schemas/Id'
+        hidden:
+          type: boolean
+        resultId:
+          $ref: '#/components/schemas/Id'
+        totalGroups:
+          type: integer
+          minimum: 0
+          description: >-
+            Recomputed visible-group count for the result. Returned so a client updates its header
+            without a second call, which is what the current handler already computes.
+        totalImages:
+          type: integer
+          minimum: 0
+        totalHiddenGroups:
+          type: integer
+          minimum: 0
+
+    # -- ingest ---------------------------------------------------------------
+
+    IngestItemsRequest:
+      type: object
+      required: [items]
+      additionalProperties: false
+      properties:
+        expectedTotal:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            How many images this walk will find in all, as the resource manager counts them. It is
+            the denominator of the progress dialog, and PDM has no way of producing it: the core
+            receives one batch at a time and never materialises a folder, so counting here would be
+            the walk a second time.
+
+            **Send it as soon as you know it, and on every batch afterwards.** It costs nothing
+            to repeat - the field rides a call you are already making - and repeating is what
+            makes a search PDM restarted, or a walk you resumed, arrive at the same number.
+            Omit it while you do not know it yet: absent means "no answer", never zero, and a
+            scan that never sends one behaves exactly as it did before this field existed.
+
+            **It may be wrong, and being wrong is not an error.** PDM never uses it as a loop
+            bound or a completion condition - only the end of your walk closes a search - and it
+            never lets it contradict what has actually arrived: a count that turns out low is
+            raised to what has been declared, so a bar cannot reach 100 percent and keep going.
+            A count that turns out high leaves the bar arriving late, which is the better of the
+            two failures. Send a corrected number whenever you have one; it is allowed to move
+            in both directions.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 10000
+          # Absolute ceiling across every deployment. The operative cap is limits.maxItemsPerBatch
+          # from GET /v1/capabilities, which is always <= this.
+          description: >-
+            What the walk found. Answered one for one, in this order. Two entries with the same
+            `imageRef` in one batch is `invalid_request`: the answer would be ambiguous and the
+            caller can dedupe more cheaply than PDM can explain.
+          items:
+            $ref: '#/components/schemas/IngestItem'
+
+    IngestItem:
+      type: object
+      required: [imageRef]
+      additionalProperties: false
+      description: |
+        One enumerated image, with whatever the resource manager already knows about it.
+
+        **The manager is the authority on metadata**, and that has not changed with the direction:
+        a cloud source knows the dimensions and the capture date without anybody reading the file,
+        and making PDM re-derive them means it has to be sent bytes it would not otherwise need.
+        What is omitted, PDM fills in from the image itself if it receives one - and if it does not,
+        the field stays empty rather than being invented. In particular there is no filesystem date
+        to fall back on: PDM has no file.
+
+        **Nothing readable is declared.** There is no `name` and no `displayPath`, because PDM keeps
+        neither and a field nobody stores is a field somebody eventually relies on.
+      properties:
+        imageRef:
+          $ref: '#/components/schemas/Ref'
+        contentHash:
+          type: [string, 'null']
+          maxLength: 256
+          description: >-
+            The source's own hash of the content, formatted `<algorithm>:<hex>`. Treated as an
+            opaque equality token: PDM never recomputes it and never assumes an algorithm. Preferred
+            over `etag` when both are given, because a hash is a statement about content and
+            survives a move, a copy and a re-upload.
+        etag:
+          type: [string, 'null']
+          maxLength: 256
+          description: >-
+            The source's own version token for the item, used when there is no `contentHash`. It is
+            deliberately a second field rather than the same one: an entity tag is only comparable
+            with entity tags from the same source, and PDM records which kind of evidence it holds
+            so that one is never read as the other.
+        sizeBytes:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: >-
+            Checked against the upload when it is given, and a disagreement fails that image with
+            `content_mismatch` rather than being embedded.
+        mimeType:
+          type: [string, 'null']
+          maxLength: 128
+        modifiedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+        photoCreatedAt:
+          oneOf:
+            - $ref: '#/components/schemas/Timestamp'
+            - type: 'null'
+          description: Capture time where the source knows it. There is no fallback if it does not.
+        width:
+          type: [integer, 'null']
+          minimum: 1
+        height:
+          type: [integer, 'null']
+          minimum: 1
+        resolutionDpi:
+          type: [integer, 'null']
+          minimum: 1
+        cacheOnly:
+          type: boolean
+          default: false
+          description: |
+            Embed this image and keep the embedding, but leave it out of this search's result.
+
+            It is what `cacheFolderRef` was in 1.x: compute over a wider folder than the one being
+            searched, so a later search inside it is nearly free. That was a folder instruction to a
+            walk PDM performed, and PDM has no concept of a directory - it could not have
+            told which of the items it was sent were inside the narrower one. The caller can, and
+            says so per item.
+
+            The embedding is cached under the content version either way, so a later search that
+            declares the same image gets `cached` whether it was `cacheOnly` or not.
+
+    IngestBatchResponse:
+      type: object
+      required: [items, credits]
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          description: One decision per declared item, in request order. Never fewer, never reordered.
+          items:
+            $ref: '#/components/schemas/IngestDecision'
+        credits:
+          type: integer
+          minimum: 0
+          description: >-
+            Images this caller may upload the bytes of right now. Absolute, not a delta. Declaring
+            spends none of it.
+        needsContentCount:
+          type: integer
+          minimum: 0
+          description: >-
+            How many of the decisions are `needsContent`. Derived from `items`, stated so a
+            conformance suite can assert the two never contradict, and useful to a caller that only
+            wants to know whether this batch produced any work.
+
+    IngestDecision:
+      type: object
+      required: [imageRef, decision]
+      additionalProperties: false
+      properties:
+        imageRef:
+          $ref: '#/components/schemas/Ref'
+          description: Echo of the declared reference.
+        decision:
+          type: string
+          enum: [cached, needsContent, rejected]
+          description: |
+            | Value | Means | What the caller does |
+            | --- | --- | --- |
+            | `cached` | PDM already holds an embedding for this content version | nothing at all |
+            | `needsContent` | send the bytes | `PUT .../items/{imageRef}/content`, spending a credit |
+            | `rejected` | this item will not be part of the search | read `error`, and do not send bytes |
+
+            A `rejected` item is refused for one of three reasons and the code says which:
+            `invalid_request` for a reference PDM cannot address, `payload_too_large` for a declared
+            size over `limits.maxImageBytes`, and `unsupported_format` for a media type naming an
+            image format this deployment cannot decode.
+
+            `cached` and `rejected` are not the same answer with different reasons, and conflating
+            them is the mistake worth naming: one means the image is in the search and finished, the
+            other means it is not in the search at all. Sending bytes for either is `409 conflict`.
+        error:
+          type: object
+          description: >-
+            Present exactly when the decision is `rejected`, and enforced by the `if/then/else`
+            below rather than left as prose, so a conformance suite can assert it - the same
+            treatment `SearchProgress.percent` and `DuplicateGroup.totalSize` get, and for the same
+            reason.
+          required: [code]
+          additionalProperties: false
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            detail:
+              type: string
+              maxLength: 512
+      if:
+        properties:
+          decision:
+            const: rejected
+        required: [decision]
+      then:
+        properties:
+          error:
+            type: object
+        required: [error]
+      else:
+        properties:
+          error: false
+
+    IngestContentResponse:
+      type: object
+      required: [imageRef, received]
+      additionalProperties: false
+      properties:
+        imageRef:
+          $ref: '#/components/schemas/Ref'
+        received:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Bytes PDM holds for this image. Equal to the declared size on a `200`; the length of the
+            prefix on a `202`, which is the offset to send from next.
+        complete:
+          type: boolean
+          description: >-
+            True on a `200`, false on a `202`. Redundant with the status, and stated anyway because a
+            resumable transfer is exactly where a client should not have to infer state from one.
+        credits:
+          type: integer
+          minimum: 0
+          description: Images this caller may upload the bytes of after this call.
+
+    CompleteIngestRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Optional. An empty body, or no body at all, means the walk finished normally - which is the
+        ordinary case and is why nothing here is required.
+      properties:
+        outcome:
+          type: string
+          enum: [completed, failed]
+          default: completed
+          description: >-
+            `failed` when the walk could not finish: the source became unreachable, an account was
+            revoked mid-scan, the process is shutting down. The search fails with `detail`, which is
+            the difference between a scan that ends and one that hangs until a cleanup worker calls
+            it interrupted.
+        detail:
+          type: string
+          maxLength: 1024
+          description: >-
+            Why the walk failed, for the user. Shown, so write it for one; never contains a
+            credential or a path on anybody's machine.
+
+    # -- images ---------------------------------------------------------------
+
+    ImagesGoneRequest:
+      type: object
+      required: [imageRefs]
+      additionalProperties: false
+      properties:
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+          description: >-
+            Required for a caller that may act for more than one resource manager, because a
+            reference means nothing without knowing whose it is.
+        imageRefs:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          # Absolute ceiling across every deployment. The operative cap is
+          # limits.maxOperationBatchSize from GET /v1/capabilities, which is always <= this.
+          description: >-
+            References that no longer exist at the source. They may name images in any result this
+            caller produced for this user, in several results at once, or in none.
+          items:
+            $ref: '#/components/schemas/Ref'
+
+    ImagesGoneResponse:
+      type: object
+      required: [removedImages, unknownRefs, affectedResults, dissolvedGroups]
+      additionalProperties: false
+      properties:
+        removedImages:
+          type: integer
+          minimum: 0
+          description: Rows dropped from stored results.
+        unknownRefs:
+          type: integer
+          minimum: 0
+          description: >-
+            References that named nothing here. An ordinary outcome, not an error: a manager deletes
+            files that were never in a duplicate group, and reporting them is right.
+        affectedResults:
+          type: integer
+          minimum: 0
+        dissolvedGroups:
+          type: integer
+          minimum: 0
+          description: >-
+            Groups that fell below two images and stopped being duplicate groups. They are removed
+            with their remaining image, and the result's aggregates are recomputed.
+
+    # -- transfer -------------------------------------------------------------
+
+    ImportRequest:
+      type: object
+      required: [document]
+      additionalProperties: false
+      properties:
+        document:
+          $ref: '#/components/schemas/ExportDocument'
+        replaceExisting:
+          type: boolean
+          default: false
+          description: Replace the result already stored for this (user, resource manager, folder).
+
+    ImportValidationResponse:
+      type: object
+      required: [valid, resourceManagerId, groupCount, imageCount]
+      additionalProperties: false
+      properties:
+        valid:
+          type: boolean
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        folderRef:
+          $ref: '#/components/schemas/Ref'
+        displayLabel:
+          type: string
+          maxLength: 256
+        groupCount:
+          type: integer
+          minimum: 0
+        imageCount:
+          type: integer
+          minimum: 0
+        conflictsWithResultId:
+          $ref: '#/components/schemas/Id'
+          description: >-
+            The result an import would replace, when one already exists. Absent means the import
+            would create a new one. This is what `GET /import/result/exists` used to answer, folded
+            into the call that already knew.
+
+    ImportResponse:
+      type: object
+      required: [resultId, replaced, groupCount, imageCount]
+      additionalProperties: false
+      properties:
+        resultId:
+          $ref: '#/components/schemas/Id'
+        replaced:
+          type: boolean
+        groupCount:
+          type: integer
+          minimum: 0
+        imageCount:
+          type: integer
+          minimum: 0
+
+    # -- tokens ---------------------------------------------------------------
+
+    AppTokenRequest:
+      type: object
+      required: [userRef]
+      additionalProperties: false
+      properties:
+        userRef:
+          type: string
+          minLength: 8
+          maxLength: 128
+          pattern: '^[A-Za-z0-9._~-]+$'
+          description: >-
+            The user this token acts for, as the opaque per (user, registration) reference from the
+            resource manager contract. A backend caller has no other way to name a user, and this is
+            the point at which it is checked that the ref belongs to this registration.
+        scopes:
+          type: array
+          description: >-
+            Subset of the granted scopes to ask for. Omitted means all of them. Asking for one that
+            was never granted is `forbidden`, not a silent narrowing.
+          items:
+            $ref: '#/components/schemas/Scope'
+
+    TokenResponse:
+      type: object
+      required: [accessToken, tokenType, expiresInSeconds, scopes]
+      additionalProperties: false
+      properties:
+        accessToken:
+          type: string
+          description: Bearer token. Never logged, never persisted beyond its lifetime.
+        tokenType:
+          type: string
+          const: Bearer
+        expiresInSeconds:
+          type: integer
+          minimum: 1
+        scopes:
+          type: array
+          description: >-
+            What the token actually carries, after narrowing. It can be narrower than what was
+            asked for, and a client should read this rather than assume.
+          items:
+            $ref: '#/components/schemas/Scope'
+        resourceManagers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceManagerId'
+
+    # -- errors ---------------------------------------------------------------
+
+    # -- the answer path ------------------------------------------------------
+
+    StreamHello:
+      type: object
+      description: |
+        The first frame of every `GET /v1/stream` connection, carrying no `id` because it is not
+        part of the sequence.
+
+        It answers one question before anything else can arrive: may this subscriber trust what it
+        already believes. `resync` is false only when the scope has sent nothing since the id the
+        caller presented; a first connection is always true, because there was nothing to be
+        continuous with.
+      required: [resourceManagerId, lastEventId, resync, heartbeatSeconds, expiresAt]
+      additionalProperties: false
+      properties:
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        lastEventId:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            The scope's sequence position now. 0 when it has sent nothing - which is also what a
+            scope nobody was listening to reports, since ids are assigned only to messages that had
+            somewhere to go.
+        resync:
+          type: boolean
+          description: >-
+            True when the caller has to reconcile before trusting what it hears. Read
+            `GET /v1/searches` and carry on from there. False only when `lastEventId` is non-zero and
+            equal to the id the caller presented, so a position of 0 on either side is always a
+            reconcile.
+        heartbeatSeconds:
+          type: integer
+          minimum: 1
+          description: How often a comment line is written when nothing is happening.
+        expiresAt:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: >-
+            When the credential behind this connection expires, which is when the response ends. A
+            stream never outlives the token that opened it.
+
+    StreamResync:
+      type: object
+      description: >-
+        This connection lost messages and its sequence can no longer be trusted. A subscriber that
+        stops reading is dropped from rather than waited for - the writer is a scan's progress tick
+        - so what was lost is stated instead of silently skipped.
+      required: [resourceManagerId, reason, at]
+      additionalProperties: false
+      properties:
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        reason:
+          type: string
+          description: >-
+            `backlog` - this connection fell behind. The only reason today, named rather than left
+            implicit so a later one can be added without a client having to guess.
+        at:
+          $ref: '#/components/schemas/Timestamp'
+
+    IngestCreditsMessage:
+      type: object
+      description: |
+        How many more images PDM will take the bytes of for one search, right now.
+
+        Absolute, never a delta. This channel drops messages for a subscriber that has fallen
+        behind, and a lost delta is a balance that stays silently wrong for the rest of a scan,
+        where an absolute number applied twice is the same number - the property that makes a
+        progress reading safe to re-apply, applied to the one other thing this connection
+        carries.
+
+        The same number is on `GET /v1/searches/{searchId}` and on the answer to every declared
+        batch. A caller that holds no stream reads it there; a caller that holds one is spared the
+        poll.
+      required: [searchId, resourceManagerId, credits, at]
+      additionalProperties: false
+      properties:
+        searchId:
+          $ref: '#/components/schemas/Id'
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        credits:
+          type: integer
+          minimum: 0
+          description: >-
+            Images whose bytes will be accepted now. Zero is an ordinary reading and means wait -
+            the embedding stage is working through what it already has - not that anything is wrong.
+        at:
+          $ref: '#/components/schemas/Timestamp'
+
+    SearchGroupsMessage:
+      type: object
+      description: |
+        A running search has formed more duplicate groups than you have seen. The payload of
+        `search_groups`.
+
+        A snapshot and not a delta: both numbers are totals, so applying the same message twice is
+        the same message - the property that makes a progress reading safe to re-apply and a credit
+        balance safe to lose.
+
+        **The groups are not on it.** A snapshot of a large library is thousands of references, this
+        channel drops messages for a subscriber that has fallen behind rather than waiting for it,
+        and the screen that renders them renders one page. So this says there is more to look at and
+        how much, and `GET /v1/searches/{searchId}/groups` is where it is looked at.
+      required: [searchId, resourceManagerId, groups, images, at]
+      additionalProperties: false
+      properties:
+        searchId:
+          $ref: '#/components/schemas/Id'
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        groups:
+          type: integer
+          minimum: 0
+          description: Duplicate groups formed so far.
+        images:
+          type: integer
+          minimum: 0
+          description: Duplicated images across those groups.
+        at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: When the snapshot was taken. Order on this, not on arrival.
+
+    SearchStreamMessage:
+      type: object
+      description: |
+        One search moved, or ended. The payload of both `search_progress` and `search_ended`.
+
+        The numbers are the ones `GET /v1/searches/{searchId}` answers with, because they are the
+        same reading pushed rather than a second measurement of it.
+      required: [resourceManagerId, status, progress, at]
+      additionalProperties: false
+      properties:
+        searchId:
+          allOf:
+            - $ref: '#/components/schemas/Id'
+          description: >-
+            The search this is about. Absent when nothing named it - a reading that survived an
+            upgrade mid-scan - and then a subscriber asks which searches this manager is running
+            rather than assuming.
+        resourceManagerId:
+          $ref: '#/components/schemas/ResourceManagerId'
+        status:
+          $ref: '#/components/schemas/SearchStatus'
+        progress:
+          $ref: '#/components/schemas/SearchProgress'
+        error:
+          type: object
+          description: Present when the status is `failed`. The same shape a search carries one in.
+          required: [code]
+          additionalProperties: false
+          properties:
+            code:
+              $ref: '#/components/schemas/ErrorCode'
+            detail:
+              type: string
+              maxLength: 1024
+        at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          description: When PDM took the reading. Order on this, not on arrival.
+
+    ErrorCode:
+      type: string
+      description: |
+        Stable machine codes. A client branches and localises on these and never on `title` or
+        `detail`.
+
+        | Code | Typical status | Meaning |
+        | --- | --- | --- |
+        | `invalid_request` | 400 | Malformed, or a declared limit was violated. |
+        | `unsupported_core_version` | 400 | The requested version cannot be served. |
+        | `content_mismatch` | 400, 409 | The bytes and the declaration disagree, or a range does not continue. |
+        | `unauthenticated` | 401 | No usable token. |
+        | `insufficient_scope` | 403 | The registration was never granted this operation. |
+        | `insufficient_permission` | 403 | The user behind the call may not do it. |
+        | `forbidden` | 403 | The object belongs to another user or another registration. |
+        | `not_found` | 404 | No such object for this caller, or the feature is disabled here. |
+        | `conflict` | 409 | State prevents the operation. |
+        | `search_already_running` | 409 | A search is already in flight for this user and manager. |
+        | `search_not_ingesting` | 409 | The search takes no more items: walk closed, or ended. |
+        | `unsupported_format` | per item | The declared media type is an image format PDM cannot decode. |
+        | `payload_too_large` | 413 | Batch, image or document over the declared limit. |
+        | `rate_limited` | 429 | Back off, honour `Retry-After`. |
+        | `ingest_credit_exhausted` | 429 | No credit for this upload. Wait for one, do not retry on a timer. |
+        | `internal_error` | 500 | Anything else on PDM's side. |
+
+        Pairs are kept apart where each leads a client somewhere different. `insufficient_scope`
+        versus `insufficient_permission` is "ask an administrator" versus "tell the user".
+        `rate_limited` versus `ingest_credit_exhausted` is "wait `Retry-After` seconds" versus "wait
+        to be told there is room" - a distinction with no `Retry-After` that would be honest, since
+        what has to happen is an image finishing being embedded.
+
+        `unsupported_format` has no HTTP status of its own, and is the only code here that does
+        not: it is a verdict about one declared item and never about a request, so it appears as
+        the `error.code` of a `rejected` item and nowhere else. A batch of a thousand items of
+        which one is a Photoshop document is a `200` carrying 999 decisions and one refusal, which
+        is the whole reason ingest answers per item rather than per call.
+
+        `content_mismatch` carries two statuses and one meaning: the bytes and the declaration
+        disagree. 400 when the body itself is wrong - a length or a hash that does not match what
+        the batch said. 409 when a resumed `Content-Range` does not continue what PDM holds, which
+        is a disagreement about state rather than about content, and the `Range` header then says
+        what PDM has.
+
+        Five codes went at 2.0 with the operations that produced them: `capability_expired` and
+        `capability_revoked` with the capability token, and
+        `resource_manager_capability_missing`, `resource_manager_auth_required` and
+        `resource_manager_unavailable` with the calls PDM used to make to a resource manager.
+        Nothing here can produce them, and a code PDM can never emit is a branch every client
+        carries for nothing.
+      enum:
+        - invalid_request
+        - unsupported_core_version
+        - content_mismatch
+        - unauthenticated
+        - insufficient_scope
+        - insufficient_permission
+        - forbidden
+        - not_found
+        - conflict
+        - search_already_running
+        - search_not_ingesting
+        - unsupported_format
+        - payload_too_large
+        - rate_limited
+        - ingest_credit_exhausted
+        - internal_error
+
+    Problem:
+      type: object
+      description: RFC 9457 problem document with PDM extensions.
+      required: [status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          default: about:blank
+        title:
+          type: string
+          maxLength: 256
+          description: Short, human-readable, stable per `code`. Not localised by PDM.
+        status:
+          type: integer
+          minimum: 100
+          maximum: 599
+        detail:
+          type: string
+          maxLength: 1024
+          description: >-
+            What went wrong this time. Never contains a token, a credential, an internal user id, or
+            a path from a resource the caller may not read.
+        instance:
+          type: string
+          maxLength: 256
+          description: Echo of `PDM-Request-Id`.
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        conflictingSearchId:
+          $ref: '#/components/schemas/Id'
+        conflictsWithResultId:
+          $ref: '#/components/schemas/Id'
+        retryAfterSeconds:
+          type: integer
+          minimum: 0
+        heldBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: >-
+            Set with `content_mismatch` on a resumed upload: the length of the prefix PDM holds,
+            which is the offset to send from. The `Range` header carries the same fact for a client
+            that reads headers rather than bodies.
+      additionalProperties: true
