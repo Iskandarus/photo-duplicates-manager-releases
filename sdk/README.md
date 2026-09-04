@@ -1,4 +1,4 @@
-# Photo Duplicates Manager - resource manager SDK 3.0.4
+# Photo Duplicates Manager - resource manager SDK 3.0.5
 
 Everything you need to write a resource manager: a program that owns a collection of photographs and
 wants Photo Duplicates Manager to find the duplicates in it.
@@ -26,7 +26,7 @@ cannot say.
 
 ## And the tool, beside this zip
 
-`pdm-harness-3.0.4-<platform>` is on the same release. It **plays the core** on a loopback port,
+`pdm-harness-3.0.5-<platform>` is on the same release. It **plays the core** on a loopback port,
 so you can drive your manager against something that answers and be told which of eighteen rules it
 broke and at which call. One self-contained file: nothing to install, no runtime to fetch. On macOS
 and Linux, unpack the `.tar.gz` and `chmod +x pdm-harness`.
@@ -35,7 +35,7 @@ and Linux, unpack the `.tar.gz` and `chmod +x pdm-harness`.
 
 ## Versions
 
-This SDK is **3.0.4**: core API **3.0**, revision **4**. The
+This SDK is **3.0.5**: core API **3.0**, revision **5**. The
 first two numbers are the contract's own version, which is what your client negotiates with the
 `PDM-Core-Version` header on every request. The third counts re-publications of the same contract -
 a clearer guide, a corrected example, a fix in the harness - and means nothing to a client.
@@ -48,7 +48,7 @@ nothing, which is usually the honest answer: a minor is additive.
 
 ## Where this came from
 
-Iskandarus/photo-duplicates-manager-releases, tag `sdk-v3.0.4`. PDM's own source is not
+Iskandarus/photo-duplicates-manager-releases, tag `sdk-v3.0.5`. PDM's own source is not
 public; these documents are, because a contract nobody can read is not a contract.
 
 Sentences in these documents sometimes name a file in PDM's repository. Those links are flattened to
