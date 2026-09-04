@@ -32,7 +32,7 @@ Two different things are released here and they carry different numbers, because
 
 | Application | Core API | Resource manager SDK | Date |
 | --- | --- | --- | --- |
-| [0.3.0](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/v0.3.0-cm) | 3.0 | [3.0.4](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4) - the contract, the documents and `pdm-harness` | 2026-09-04 |
+| [0.3.0](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/v0.3.0-cm) | 3.0 | [3.0.5](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.5) - the contract, the documents and `pdm-harness` | 2026-09-04 |
 | 0.2.2 and earlier | not published | not published | up to 2026-07-28 |
 
 Every application release repeats its own row in its release notes, so the version table travels with the download rather than only living here.
@@ -41,7 +41,7 @@ Every application release repeats its own row in its release notes, so the versi
 
 A **resource manager** is a program that owns a collection of photographs - a folder on a disk, a cloud drive, a photo service - and wants PDM to find the duplicates in it. Anybody can write one; you implement no API and serve nothing to PDM.
 
-Everything you need is one download: **[Resource manager SDK 3.0.4](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.4)**, which is the newest `sdk-v*` release. This line names the current one; the table above says which application version it goes with.
+Everything you need is one download: **[Resource manager SDK 3.0.5](https://github.com/Iskandarus/photo-duplicates-manager-releases/releases/tag/sdk-v3.0.5)**, which is the newest `sdk-v*` release. This line names the current one; the table above says which application version it goes with.
 
 | | |
 | --- | --- |
@@ -49,6 +49,8 @@ Everything you need is one download: **[Resource manager SDK 3.0.4](https://gith
 | `pdm-harness-<version>-<platform>` | `pdm-harness` plays the core on a loopback port so you can drive your manager against something that answers, and tells you what it got wrong. One self-contained file - nothing to install. On macOS and Linux, unpack the `.tar.gz` and `chmod +x pdm-harness`. |
 
 Both carry the same number, so a tool and a guide out of one release always describe the same contract.
+
+**You can read the documents without downloading anything**, at [/sdk](https://github.com/Iskandarus/photo-duplicates-manager-releases/tree/HEAD/sdk) - start with [`writing-a-resource-manager.md`](https://github.com/Iskandarus/photo-duplicates-manager-releases/blob/HEAD/sdk/writing-a-resource-manager.md). That copy is pushed by the same script that assembles the zip, so it cannot say something different, and it is always the newest publication. Take the zip when you want the contract on your disk to generate a client from.
 
 ## Auto-update
 
